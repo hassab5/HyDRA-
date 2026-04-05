@@ -56,7 +56,7 @@ st.markdown("""
     --border: #1e293b;
 }
 .stApp { background: linear-gradient(135deg, var(--bg-primary) 0%, #0f172a 50%, #1a0a2e 100%); }
-.main .block-container { max-width: 1400px; padding: 1rem 2rem; }
+.main .block-container { max-width: 1400px; padding-top: 5rem; padding-bottom: 2rem; padding-left: 2rem; padding-right: 2rem;.
 div[data-testid="stSidebar"] {
     background: linear-gradient(180deg, #0f172a 0%, #1e1b4b 100%);
     border-right: 1px solid rgba(99,102,241,0.2);
