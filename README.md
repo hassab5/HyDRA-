@@ -1,12 +1,10 @@
 ---
-title: HyDRA Streamlit Version
+title: HyDRA Hybrid Drug Discovery
 emoji: 🧬
 colorFrom: indigo
 colorTo: blue
-sdk: streamlit
-python_version: "3.10"
-sdk_version: "1.38.0"
-app_file: app.py
+sdk: docker
+app_port: 7860
 pinned: true
 ---
 
@@ -51,26 +49,96 @@ A dual-pathway hybrid drug discovery pipeline combining **Fragment-Based Drug De
 
 ---
 
-## 🔧 Quick Start
+## 🔧 How to Run
 
-### Local Development
+### Option 1: Local Development (Without Docker)
+
 ```bash
+# 1. Create a virtual environment (recommended)
+python -m venv venv
+venv\Scripts\activate        # Windows
+# source venv/bin/activate   # Linux/Mac
+
+# 2. Install dependencies
 pip install -r requirements.txt
+
+# 3. Run the app
 streamlit run app.py
 ```
 
-### Hugging Face Spaces
-This app is designed for HF Spaces free tier (4GB RAM, CPU only).
+The app will open at `http://localhost:8501`
 
-```yaml
-title: HyDRA Hybrid Drug Discovery
-emoji: 🧬
-colorFrom: indigo
-colorTo: cyan
-sdk: streamlit
-sdk_version: "1.38.0"
-app_file: app.py
-pinned: true
+> **Note:** Without system-level dependencies (libboost, swig), the Vina Python package won't install. The app will automatically fall back to RDKit heuristic scoring. This is fine for testing the UI and pipeline logic.
+
+### Option 2: Local Development with Docker
+
+```bash
+# 1. Build the Docker image
+docker build -t hydra-drug-discovery .
+
+# 2. Run the container
+docker run -p 7860:7860 hydra-drug-discovery
+
+# 3. Open in browser
+#    http://localhost:7860
+```
+
+> **Tip:** Use `-d` flag for detached mode: `docker run -d -p 7860:7860 hydra-drug-discovery`
+
+### Option 3: Deploy on Hugging Face Spaces (Recommended)
+
+This is the **recommended** approach for public deployment with full Vina docking support.
+
+#### Step-by-step:
+
+1. **Create a Hugging Face account** at https://huggingface.co/join (free)
+
+2. **Install Git LFS** (for large files):
+   ```bash
+   git lfs install
+   ```
+
+3. **Create a new Space:**
+   - Go to https://huggingface.co/new-space
+   - Choose a name (e.g., `hydra-drug-discovery`)
+   - Select **Docker** as the SDK
+   - Set visibility to **Public** (free tier)
+   - Click **Create Space**
+
+4. **Clone and push your code:**
+   ```bash
+   # Clone the empty Space
+   git clone https://huggingface.co/spaces/YOUR_USERNAME/hydra-drug-discovery
+   cd hydra-drug-discovery
+
+   # Copy all project files into this directory
+   # (or initialize from your existing project)
+   
+   # Add all files
+   git add .
+   git commit -m "Initial deployment of HyDRA"
+   git push
+   ```
+
+5. **Wait for build** (~5-10 minutes for first build)
+
+6. **Access your app** at:
+   ```
+   https://YOUR_USERNAME-hydra-drug-discovery.hf.space
+   ```
+
+#### Alternative: Push from existing project
+```bash
+cd mohamed-sayed-hybrid-drug-design-v2
+
+# Add HF Spaces as a remote
+git init
+git remote add space https://huggingface.co/spaces/YOUR_USERNAME/hydra-drug-discovery
+
+# Push
+git add .
+git commit -m "Deploy HyDRA to Hugging Face Spaces"
+git push space main
 ```
 
 ---
@@ -78,11 +146,14 @@ pinned: true
 ## 📁 Project Structure
 
 ```
-mohamed-sayed-hybrid-drug-design/
+mohamed-sayed-hybrid-drug-design-v2/
 ├── app.py                          # Main Streamlit app (8 tabs)
+├── Dockerfile                      # Docker configuration for HF Spaces
 ├── requirements.txt                # Python dependencies
-├── packages.txt                    # System packages (HF Spaces)
-├── README.md                       # This file
+├── packages.txt                    # System packages (HF Spaces legacy)
+├── README.md                       # This file (+ HF Spaces metadata)
+├── .dockerignore                   # Docker build exclusions
+├── .gitignore                      # Git exclusions
 ├── modules/
 │   ├── __init__.py
 │   ├── pharmacophore.py            # Pharmacophore + ML classifier
@@ -96,7 +167,7 @@ mohamed-sayed-hybrid-drug-design/
 ├── static/
 │   └── logo.png                    # App logo
 └── .streamlit/
-    └── config.toml                 # Streamlit theming
+    └── config.toml                 # Streamlit theming (local dev)
 ```
 
 ---
@@ -135,10 +206,23 @@ Click **"🧪 Load EGFR Demo Data"** on the Launch tab to load pre-packaged EGFR
 ## 🛠️ Technical Details
 
 - **Memory:** Optimized for 4GB RAM with chunked processing
-- **Docking:** AutoDock Vina (primary) with RDKit fallback scoring
+- **Docking:** AutoDock Vina Python API (primary) with RDKit fallback scoring
 - **ML:** scikit-learn RandomForest with 5-fold CV
 - **3D:** py3Dmol for interactive molecular visualization
 - **Charts:** Plotly for radar, scatter, parallel coordinates
+- **Deployment:** Docker-based for full system dependency support
+
+---
+
+## 🌐 Deployment Platforms Comparison
+
+| Platform | Docker Support | Free Tier RAM | Vina Support | Verdict |
+|----------|---------------|---------------|--------------|---------|
+| **HF Spaces** | ✅ Docker SDK | 16 GB | ✅ Full | **Best choice** |
+| Streamlit Cloud | ❌ No Docker | 1 GB | ❌ No system deps | Too limited |
+| Render | ✅ Docker | 512 MB | ❌ Too little RAM | Not enough |
+| Railway | ✅ Docker | 512 MB (trial) | ⚠️ Limited | Short trial |
+| Fly.io | ✅ Docker | 256 MB | ❌ Too little RAM | Not enough |
 
 ---
 

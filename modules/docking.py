@@ -1,13 +1,18 @@
 """
-Molecular Docking Module — AutoDock Vina Wrapper
-=================================================
+Molecular Docking Module — AutoDock Vina (Python API Primary)
+=============================================================
 Handles:
-  - Receptor/ligand preparation (PDB → PDBQT via meeko or obabel)
+  - Receptor/ligand preparation (PDB → PDBQT)
   - Binding site auto-detection from PDB coordinates
-  - AutoDock Vina docking (subprocess-based)
+  - AutoDock Vina docking via Python API (primary) or CLI (secondary)
   - Multi-pose output parsing (5 poses per molecule)
-  - Fallback scoring using RDKit shape/pharmacophore when Vina unavailable
+  - Fallback scoring using RDKit shape/pharmacophore ONLY when Vina unavailable
   - Batch docking with chunked processing for memory efficiency
+
+Priority Order:
+  1. Python Vina API  (from vina import Vina)
+  2. Vina CLI binary   (subprocess)
+  3. Fallback scoring   (RDKit heuristic — last resort)
 """
 
 import os
@@ -25,9 +30,34 @@ from rdkit.Chem import rdMolAlign
 
 logger = logging.getLogger(__name__)
 
-# ─── VINA BINARY DETECTION ──────────────────────────────────────────────
+# ─── CHECK VINA AVAILABILITY AT MODULE LOAD ────────────────────────────
+_VINA_PYTHON_AVAILABLE = False
+try:
+    from vina import Vina as _VinaClass
+    _VINA_PYTHON_AVAILABLE = True
+    logger.info("✅ Python Vina API available — real docking enabled")
+except ImportError:
+    logger.warning(
+        "⚠️ Python Vina not installed. Install with: "
+        "pip install vina (requires libboost-all-dev, swig). "
+        "Falling back to heuristic scoring."
+    )
+
+_MEEKO_AVAILABLE = False
+try:
+    from meeko import MoleculePreparation, PDBQTWriterLegacy
+    _MEEKO_AVAILABLE = True
+    logger.info("✅ Meeko available for PDBQT ligand preparation")
+except ImportError:
+    logger.warning("⚠️ Meeko not installed — ligand prep will use simple converter")
+
+
 def find_vina_binary():
     """Locate the AutoDock Vina binary on the system."""
+    # Check Python API first (preferred)
+    if _VINA_PYTHON_AVAILABLE:
+        return "python_vina"
+    # Then check CLI binaries
     candidates = [
         "vina",
         "vina_1.2.5",
@@ -38,18 +68,12 @@ def find_vina_binary():
     for path in candidates:
         if path and shutil.which(path):
             return shutil.which(path)
-    # Check if installed via pip (vina python package)
-    try:
-        from vina import Vina
-        return "python_vina"
-    except ImportError:
-        pass
     return None
 
 
 def check_vina_available():
-    """Check if AutoDock Vina is available."""
-    return find_vina_binary() is not None
+    """Check if AutoDock Vina is available (Python API or CLI)."""
+    return _VINA_PYTHON_AVAILABLE or find_vina_binary() is not None
 
 
 # ─── BINDING SITE DETECTION ─────────────────────────────────────────────
@@ -107,10 +131,106 @@ def detect_binding_site(pdb_block: str, active_mols=None, distance_cutoff=6.0):
     return tuple(center.round(3)), tuple(box_size.round(1))
 
 
+# ─── LIGAND PDBQT PREPARATION (IN-MEMORY) ───────────────────────────────
+def _prepare_ligand_3d(mol):
+    """Add hydrogens and generate 3D coordinates for a molecule.
+    Returns the 3D mol or None on failure."""
+    if mol is None:
+        return None
+    try:
+        mol = Chem.AddHs(mol)
+        params = AllChem.ETKDGv3()
+        params.randomSeed = 42
+        result = AllChem.EmbedMolecule(mol, params)
+        if result == -1:
+            # Fallback to simpler embedding
+            result = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+            if result == -1:
+                return None
+        # Minimize with MMFF
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
+        except Exception:
+            try:
+                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+            except Exception:
+                pass
+        return mol
+    except Exception as e:
+        logger.debug(f"3D embedding failed: {e}")
+        return None
+
+
+def prepare_ligand_pdbqt_string(mol) -> Optional[str]:
+    """Prepare ligand PDBQT as an in-memory string using meeko.
+    
+    This avoids writing temporary files for ligand preparation,
+    which is critical for batch docking performance.
+    
+    Returns: PDBQT string or None on failure.
+    """
+    mol3d = _prepare_ligand_3d(mol)
+    if mol3d is None:
+        return None
+
+    # Method 1: Meeko (preferred — proper torsion tree, charges)
+    if _MEEKO_AVAILABLE:
+        try:
+            preparator = MoleculePreparation()
+            mol_setups = preparator.prepare(mol3d)
+            setup = mol_setups[0]
+            pdbqt_string, is_ok, err = PDBQTWriterLegacy.write_string(setup)
+            if pdbqt_string and len(pdbqt_string.strip()) > 0:
+                return pdbqt_string
+        except Exception as e:
+            logger.debug(f"Meeko ligand prep failed: {e}")
+
+    # Method 2: Simple PDB → PDBQT conversion
+    try:
+        pdb_block = Chem.MolToPDBBlock(mol3d)
+        if not pdb_block:
+            return None
+        pdbqt_lines = ["ROOT"]
+        for line in pdb_block.split('\n'):
+            if line.startswith("HETATM") or line.startswith("ATOM"):
+                atom_name = line[12:16].strip()
+                element = atom_name[0]
+                charge_map = {
+                    "C": 0.1, "N": -0.3, "O": -0.4, "S": -0.2,
+                    "H": 0.1, "F": -0.2, "P": 0.2,
+                }
+                charge = charge_map.get(element, 0.0)
+                atom_type_map = {
+                    "C": "C", "N": "NA", "O": "OA", "S": "SA",
+                    "H": "HD", "F": "F", "P": "P",
+                }
+                atom_type = atom_type_map.get(element, "C")
+                pdbqt_line = f"{line[:54].rstrip():<54s}  1.00  0.00    {charge:+6.3f} {atom_type:>2s}"
+                pdbqt_lines.append(pdbqt_line)
+        pdbqt_lines.append("ENDROOT\nTORSDOF 0\n")
+        return '\n'.join(pdbqt_lines)
+    except Exception as e:
+        logger.debug(f"Simple ligand PDBQT conversion failed: {e}")
+        return None
+
+
+def prepare_ligand(mol, output_dir: str, mol_id: str = "ligand") -> Optional[str]:
+    """Prepare ligand PDBQT file on disk.
+    Used by CLI docking path. For Python API, use prepare_ligand_pdbqt_string().
+    """
+    pdbqt_string = prepare_ligand_pdbqt_string(mol)
+    if pdbqt_string is None:
+        return None
+    pdbqt_path = os.path.join(output_dir, f"{mol_id}.pdbqt")
+    with open(pdbqt_path, 'w') as f:
+        f.write(pdbqt_string)
+    return pdbqt_path
+
+
 # ─── RECEPTOR PREPARATION ───────────────────────────────────────────────
 def prepare_receptor(pdb_block: str, output_dir: str) -> str:
     """Prepare receptor PDBQT from PDB block.
-    Tries multiple methods: meeko, obabel, or simplified conversion."""
+    Tries multiple methods: obabel, prepare_receptor, or simplified conversion."""
     pdb_path = os.path.join(output_dir, "receptor.pdb")
     pdbqt_path = os.path.join(output_dir, "receptor.pdbqt")
     
@@ -180,99 +300,89 @@ def prepare_receptor(pdb_block: str, output_dir: str) -> str:
     return pdbqt_path
 
 
-# ─── LIGAND PREPARATION ─────────────────────────────────────────────────
-def prepare_ligand(mol, output_dir: str, mol_id: str = "ligand") -> Optional[str]:
-    """Prepare ligand PDBQT from RDKit mol.
-    Generates 3D coordinates if not present, then converts to PDBQT."""
-    if mol is None:
-        return None
+# ─── PYTHON VINA DOCKING (PRIMARY PATH) ─────────────────────────────────
+def _dock_molecule_python_vina(
+    mol,
+    receptor_pdbqt_path: str,
+    center: Tuple[float, float, float],
+    box_size: Tuple[float, float, float] = (20.0, 20.0, 20.0),
+    exhaustiveness: int = 8,
+    num_modes: int = 5,
+    energy_range: float = 3.0,
+) -> Optional[Dict]:
+    """Dock using the Python Vina API (from vina import Vina).
     
+    This is the PRIMARY docking method. Uses in-memory PDBQT strings
+    for ligands (via meeko) to avoid excessive disk I/O.
+    """
+    if not _VINA_PYTHON_AVAILABLE:
+        return None
+
     try:
-        # Add hydrogens and generate 3D
-        mol = Chem.AddHs(mol)
-        params = AllChem.ETKDGv3()
-        params.randomSeed = 42
-        result = AllChem.EmbedMolecule(mol, params)
-        if result == -1:
-            # Fallback to simpler embedding
-            result = AllChem.EmbedMolecule(mol, AllChem.ETKDG())
-            if result == -1:
-                return None
-        
-        # Minimize with MMFF
+        from vina import Vina
+        v = Vina(sf_name='vina')
+        v.set_receptor(receptor_pdbqt_path)
+        v.compute_vina_maps(center=list(center), box_size=list(box_size))
+
+        # Prepare ligand PDBQT string (in-memory, no temp files)
+        pdbqt_string = prepare_ligand_pdbqt_string(mol)
+        if not pdbqt_string:
+            logger.warning("Failed to prepare ligand PDBQT string")
+            return None
+
+        # Try in-memory ligand loading first
         try:
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
+            v.set_ligand_from_string(pdbqt_string)
         except Exception:
-            try:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
-            except Exception:
-                pass
-        
-        pdb_path = os.path.join(output_dir, f"{mol_id}.pdb")
-        pdbqt_path = os.path.join(output_dir, f"{mol_id}.pdbqt")
-        
-        # Write PDB
-        Chem.MolToPDBFile(mol, pdb_path)
-        
-        # Try obabel conversion
-        obabel = shutil.which("obabel")
-        if obabel:
-            try:
-                result = subprocess.run(
-                    [obabel, pdb_path, "-O", pdbqt_path, "-xn", "-xp"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if os.path.exists(pdbqt_path) and os.path.getsize(pdbqt_path) > 0:
-                    return pdbqt_path
-            except Exception:
-                pass
-        
-        # Try meeko
-        try:
-            from meeko import MoleculePreparation, PDBQTWriterLegacy
-            preparator = MoleculePreparation()
-            mol_setup = preparator.prepare(mol)[0]
-            pdbqt_string, _, _ = PDBQTWriterLegacy.write_string(mol_setup)
-            with open(pdbqt_path, 'w') as f:
+            # Fallback: write to temp file
+            with tempfile.NamedTemporaryFile(
+                suffix='.pdbqt', mode='w', delete=False
+            ) as f:
                 f.write(pdbqt_string)
-            return pdbqt_path
+                tmp_lig = f.name
+            try:
+                v.set_ligand_from_file(tmp_lig)
+            finally:
+                try:
+                    os.unlink(tmp_lig)
+                except OSError:
+                    pass
+
+        # Run docking
+        v.dock(exhaustiveness=exhaustiveness, n_poses=num_modes)
+
+        # Extract energies
+        energies = v.energies()
+        scores = []
+        for i, energy in enumerate(energies):
+            scores.append({
+                "pose": i + 1,
+                "score": round(float(energy[0]), 2),
+                "rmsd_lb": round(float(energy[1]), 2) if len(energy) > 1 else 0.0,
+                "rmsd_ub": round(float(energy[2]), 2) if len(energy) > 2 else 0.0,
+            })
+
+        # Write poses to temp file for downstream use
+        output_dir = tempfile.mkdtemp()
+        output_path = os.path.join(output_dir, "docked.pdbqt")
+        try:
+            v.write_poses(output_path, n_poses=num_modes)
         except Exception:
             pass
-        
-        # Simple PDBQT generation from PDB
-        _simple_pdb_to_pdbqt(pdb_path, pdbqt_path)
-        if os.path.exists(pdbqt_path):
-            return pdbqt_path
-        
-        return None
+
+        return {
+            "scores": scores,
+            "output_file": output_path,
+            "best_score": scores[0]["score"] if scores else None,
+            "num_poses": len(scores),
+            "method": "vina_python",
+        }
     except Exception as e:
-        logger.error(f"Ligand prep failed for {mol_id}: {e}")
+        logger.error(f"Python Vina docking failed: {e}")
         return None
 
 
-def _simple_pdb_to_pdbqt(pdb_path, pdbqt_path):
-    """Simple PDB to PDBQT conversion with charge assignment."""
-    with open(pdb_path, 'r') as f:
-        lines = f.readlines()
-    
-    pdbqt_lines = ["ROOT"]
-    for line in lines:
-        if line.startswith("HETATM") or line.startswith("ATOM"):
-            atom_name = line[12:16].strip()
-            element = atom_name[0]
-            charge_map = {"C": 0.1, "N": -0.3, "O": -0.4, "S": -0.2, "H": 0.1, "F": -0.2, "Cl": -0.1, "Br": -0.1}
-            charge = charge_map.get(element, 0.0)
-            atom_type_map = {"C": "C", "N": "NA", "O": "OA", "S": "SA", "H": "HD", "F": "F", "Cl": "Cl", "Br": "Br"}
-            atom_type = atom_type_map.get(element, "C")
-            pdbqt_line = f"{line[:54].rstrip():<54s}  1.00  0.00    {charge:+6.3f} {atom_type:>2s}\n"
-            pdbqt_lines.append(pdbqt_line)
-    pdbqt_lines.append("ENDROOT\nTORSDOF 0\n")
-    
-    with open(pdbqt_path, 'w') as f:
-        f.writelines(pdbqt_lines)
-
-
-# ─── VINA DOCKING ───────────────────────────────────────────────────────
+# ─── VINA CLI DOCKING (SECONDARY PATH) ──────────────────────────────────
 def dock_molecule_vina_cli(
     ligand_pdbqt: str,
     receptor_pdbqt: str,
@@ -283,7 +393,7 @@ def dock_molecule_vina_cli(
     energy_range: float = 3.0,
     output_dir: str = None,
 ) -> Optional[Dict]:
-    """Dock a single molecule using Vina CLI."""
+    """Dock a single molecule using Vina CLI (secondary path)."""
     vina_bin = find_vina_binary()
     if not vina_bin or vina_bin == "python_vina":
         return None
@@ -324,61 +434,13 @@ def dock_molecule_vina_cli(
             "output_file": output_pdbqt,
             "best_score": scores[0]["score"] if scores else None,
             "num_poses": len(scores),
+            "method": "vina_cli",
         }
     except subprocess.TimeoutExpired:
         logger.warning("Vina timed out")
         return None
     except Exception as e:
         logger.error(f"Vina docking failed: {e}")
-        return None
-
-
-def dock_molecule_python_vina(
-    mol,
-    receptor_pdbqt: str,
-    center: Tuple[float, float, float],
-    box_size: Tuple[float, float, float] = (20.0, 20.0, 20.0),
-    exhaustiveness: int = 8,
-    num_modes: int = 5,
-    energy_range: float = 3.0,
-) -> Optional[Dict]:
-    """Dock using python Vina API."""
-    try:
-        from vina import Vina
-        v = Vina(sf_name='vina')
-        v.set_receptor(receptor_pdbqt)
-        v.compute_vina_maps(center=list(center), box_size=list(box_size))
-        
-        # Prepare ligand
-        tmp = tempfile.mkdtemp()
-        lig_path = prepare_ligand(mol, tmp, "lig")
-        if not lig_path:
-            return None
-        
-        v.set_ligand_from_file(lig_path)
-        v.dock(exhaustiveness=exhaustiveness, n_poses=num_modes)
-        
-        energies = v.energies()
-        scores = []
-        for i, energy in enumerate(energies):
-            scores.append({
-                "pose": i + 1,
-                "score": round(float(energy[0]), 2),
-                "rmsd_lb": round(float(energy[1]), 2) if len(energy) > 1 else 0.0,
-                "rmsd_ub": round(float(energy[2]), 2) if len(energy) > 2 else 0.0,
-            })
-        
-        output_path = os.path.join(tmp, "docked.pdbqt")
-        v.write_poses(output_path, n_poses=num_modes)
-        
-        return {
-            "scores": scores,
-            "output_file": output_path,
-            "best_score": scores[0]["score"] if scores else None,
-            "num_poses": len(scores),
-        }
-    except Exception as e:
-        logger.error(f"Python Vina docking failed: {e}")
         return None
 
 
@@ -429,11 +491,12 @@ def parse_vina_output(pdbqt_path: str) -> List[Dict]:
     return scores
 
 
-# ─── FALLBACK SCORING ───────────────────────────────────────────────────
+# ─── FALLBACK SCORING (LAST RESORT) ────────────────────────────────────
 def fallback_score(mol, reference_mols=None, pharmacophore_features=None):
     """Estimate a 'docking-like' score when Vina is unavailable.
     Uses RDKit molecular descriptors + shape complementarity heuristic.
     
+    ⚠️ This is NOT real docking. Scores are heuristic approximations.
     Returns a simulated Vina-like score (negative, more negative = better).
     """
     if mol is None:
@@ -542,7 +605,12 @@ def dock_molecule(
     energy_range: float = 3.0,
     output_dir: str = None,
 ) -> Dict:
-    """Unified docking interface. Tries real Vina first, falls back to scoring.
+    """Unified docking interface.
+    
+    Priority:
+      1. Python Vina API  → method="vina_python"
+      2. Vina CLI binary  → method="vina_cli"
+      3. Fallback scoring → method="fallback_scoring"
     
     Returns dict with: scores, best_score, num_poses, method
     """
@@ -554,11 +622,26 @@ def dock_molecule(
     
     if output_dir is None:
         output_dir = tempfile.mkdtemp()
-    
-    # Try real Vina first
+
+    # ── PATH 1: Python Vina API (PRIMARY) ──
+    if _VINA_PYTHON_AVAILABLE:
+        try:
+            receptor_path = prepare_receptor(pdb_block, output_dir)
+            result = _dock_molecule_python_vina(
+                mol, receptor_path, center, box_size,
+                exhaustiveness, num_modes, energy_range
+            )
+            if result and result.get("scores"):
+                logger.debug(
+                    f"Python Vina docked: best={result['best_score']} kcal/mol"
+                )
+                return result
+        except Exception as e:
+            logger.warning(f"Python Vina failed: {e}")
+
+    # ── PATH 2: Vina CLI binary (SECONDARY) ──
     vina_bin = find_vina_binary()
     if vina_bin and vina_bin != "python_vina":
-        # CLI Vina
         try:
             receptor_path = prepare_receptor(pdb_block, output_dir)
             lig_path = prepare_ligand(mol, output_dir, "lig")
@@ -568,27 +651,12 @@ def dock_molecule(
                     exhaustiveness, num_modes, energy_range, output_dir
                 )
                 if result and result["scores"]:
-                    result["method"] = "vina_cli"
                     return result
         except Exception as e:
-            logger.warning(f"Vina CLI failed, trying Python API: {e}")
-    
-    if vina_bin == "python_vina":
-        # Python Vina API
-        try:
-            receptor_path = prepare_receptor(pdb_block, output_dir)
-            result = dock_molecule_python_vina(
-                mol, receptor_path, center, box_size,
-                exhaustiveness, num_modes, energy_range
-            )
-            if result and result["scores"]:
-                result["method"] = "vina_python"
-                return result
-        except Exception as e:
-            logger.warning(f"Python Vina failed, using fallback: {e}")
-    
-    # Fallback scoring
-    logger.info("Using fallback scoring (Vina not available)")
+            logger.warning(f"Vina CLI failed: {e}")
+
+    # ── PATH 3: Fallback scoring (LAST RESORT) ──
+    logger.info("⚠️ Using fallback scoring (Vina not available)")
     poses = generate_fallback_poses(mol, num_modes)
     scores = [{"pose": p["pose"], "score": p["score"],
                "rmsd_lb": p["rmsd_lb"], "rmsd_ub": p["rmsd_ub"]} for p in poses]
@@ -613,19 +681,114 @@ def dock_batch(
     max_molecules: int = 500,
     progress_callback: Callable = None,
 ) -> List[Dict]:
-    """Dock a batch of molecules. Returns list of results with scores."""
+    """Dock a batch of molecules. Returns list of results with scores.
+    
+    Optimization: Receptor is prepared ONCE and reused for all molecules.
+    With Python Vina API, ligands are prepared as in-memory PDBQT strings
+    to avoid excessive disk I/O.
+    """
     if center is None:
         center, box_size = detect_binding_site(pdb_block)
     
     results = []
     n = min(len(molecules), max_molecules)
-    
+
+    # ── Prepare receptor ONCE for the entire batch ──
+    shared_receptor_dir = tempfile.mkdtemp()
+    shared_receptor_path = None
+    vina_instance = None
+
+    if _VINA_PYTHON_AVAILABLE:
+        try:
+            shared_receptor_path = prepare_receptor(pdb_block, shared_receptor_dir)
+            # Pre-compute Vina maps once (expensive step)
+            from vina import Vina
+            vina_instance = Vina(sf_name='vina')
+            vina_instance.set_receptor(shared_receptor_path)
+            vina_instance.compute_vina_maps(
+                center=list(center), box_size=list(box_size)
+            )
+            logger.info(
+                f"Vina maps computed for batch docking: "
+                f"center={center}, box={box_size}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to pre-compute Vina maps: {e}")
+            vina_instance = None
+
     for i in range(n):
         mol = molecules[i]
-        smi = smiles_list[i] if i < len(smiles_list) else Chem.MolToSmiles(mol) if mol else "Unknown"
+        smi = (
+            smiles_list[i]
+            if i < len(smiles_list)
+            else Chem.MolToSmiles(mol) if mol else "Unknown"
+        )
         
         try:
-            # Use temp dir for each molecule to avoid file conflicts
+            # ── Fast path: reuse pre-computed Vina maps ──
+            if vina_instance is not None and mol is not None:
+                try:
+                    pdbqt_string = prepare_ligand_pdbqt_string(mol)
+                    if pdbqt_string:
+                        # Try in-memory first
+                        try:
+                            vina_instance.set_ligand_from_string(pdbqt_string)
+                        except Exception:
+                            with tempfile.NamedTemporaryFile(
+                                suffix='.pdbqt', mode='w', delete=False
+                            ) as f:
+                                f.write(pdbqt_string)
+                                tmp_lig = f.name
+                            try:
+                                vina_instance.set_ligand_from_file(tmp_lig)
+                            finally:
+                                try:
+                                    os.unlink(tmp_lig)
+                                except OSError:
+                                    pass
+
+                        vina_instance.dock(
+                            exhaustiveness=exhaustiveness,
+                            n_poses=num_modes
+                        )
+                        energies = vina_instance.energies()
+                        scores = []
+                        for j, energy in enumerate(energies):
+                            scores.append({
+                                "pose": j + 1,
+                                "score": round(float(energy[0]), 2),
+                                "rmsd_lb": (
+                                    round(float(energy[1]), 2)
+                                    if len(energy) > 1 else 0.0
+                                ),
+                                "rmsd_ub": (
+                                    round(float(energy[2]), 2)
+                                    if len(energy) > 2 else 0.0
+                                ),
+                            })
+                        
+                        dock_result = {
+                            "scores": scores,
+                            "best_score": (
+                                scores[0]["score"] if scores else 0.0
+                            ),
+                            "num_poses": len(scores),
+                            "method": "vina_python",
+                            "smiles": smi,
+                            "mol_index": i,
+                        }
+                        results.append(dock_result)
+
+                        if progress_callback:
+                            progress_callback(i + 1, n)
+                        continue
+                except Exception as e:
+                    logger.debug(
+                        f"Batch Vina failed for mol {i}, "
+                        f"falling through: {e}"
+                    )
+
+            # ── Slow path: per-molecule dock_molecule() ──
             with tempfile.TemporaryDirectory() as tmpdir:
                 dock_result = dock_molecule(
                     mol, pdb_block, center, box_size,
@@ -634,6 +797,7 @@ def dock_batch(
                 dock_result["smiles"] = smi
                 dock_result["mol_index"] = i
                 results.append(dock_result)
+
         except Exception as e:
             logger.error(f"Docking failed for mol {i}: {e}")
             results.append({
@@ -647,6 +811,12 @@ def dock_batch(
         
         if progress_callback:
             progress_callback(i + 1, n)
+
+    # Cleanup shared receptor dir
+    try:
+        shutil.rmtree(shared_receptor_dir, ignore_errors=True)
+    except Exception:
+        pass
     
     # Sort by best score (more negative = better)
     results.sort(key=lambda x: x.get("best_score", 0.0))
@@ -740,8 +910,6 @@ def compute_prolif_interactions(mol, pdb_block, docked_pdbqt_path=None):
         total_count = 0
         
         for col in ifp_df.columns:
-            # Columns are MultiIndex tuples: (ligand_residue, protein_residue, interaction_type)
-            # or (protein_residue, interaction_type) depending on version
             try:
                 if ifp_df[col].any():
                     if isinstance(col, tuple):
@@ -933,4 +1101,3 @@ def post_docking_analysis(mol, pdb_block, vina_score=None):
         )
     
     return result
-

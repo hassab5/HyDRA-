@@ -11,6 +11,5 @@ enableXsrfProtection = true
 enableCORS = true
 headless = false
 
-
 [browser]
 gatherUsageStats = false
