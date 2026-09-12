@@ -102,13 +102,15 @@ class HybridPipeline:
         self.output_dir = tempfile.mkdtemp()
         
         # Parameters
-        self.exhaustiveness = self.params.get("exhaustiveness", 8)
+        self.exhaustiveness = self.params.get("exhaustiveness", 4)  # reduced: was 8
         self.box_size = tuple(self.params.get("box_size", [20.0, 20.0, 20.0]))
         self.num_modes = self.params.get("num_modes", 5)
         self.frag_threshold = self.params.get("frag_threshold", 0.70)
         self.evolved_threshold = self.params.get("evolved_threshold", 0.80)
         self.db_threshold = self.params.get("db_threshold", 0.80)
         self.data_dir = self.params.get("data_dir", "data")
+        # Docking budget (per pathway): keep manageable on CPU-only HF Spaces
+        self.max_dock_per_pathway = self.params.get("max_dock_per_pathway", 100)
     
     def _score_fn(self, mols):
         """Shared scoring function using trained classifier."""
@@ -203,8 +205,8 @@ class HybridPipeline:
             data_dir=self.data_dir,
             frag_threshold=self.frag_threshold,
             evolved_threshold=self.evolved_threshold,
-            top_fragments_n=200,
-            max_evolved=1000,
+            top_fragments_n=100,     # was 200
+            max_evolved=200,         # was 1000
             progress_callback=lambda s, m: progress_callback(s * 0.5, m) if progress_callback else None,
         )
         
@@ -226,31 +228,55 @@ class HybridPipeline:
                     "classifier_score": frag["score"],
                 })
         
-        # Dock top evolved molecules (up to 500)
+        # ── Pre-docking triage: Lipinski Ro5 + PAINS ──
+        from rdkit.Chem import Descriptors as _D, rdMolDescriptors as _RD, FilterCatalog as _FC
+        _pp = _FC.FilterCatalogParams()
+        _pp.AddCatalog(_FC.FilterCatalogParams.FilterCatalogs.PAINS)
+        _pains_cat = _FC.FilterCatalog(_pp)
+        def _passes_frag_triage(m):
+            if m is None:
+                return False
+            try:
+                v = sum([_D.MolWt(m) > 550, _D.MolLogP(m) > 5.5,
+                         _RD.CalcNumHBD(m) > 5, _RD.CalcNumHBA(m) > 10])
+                return v == 0 and _pains_cat.GetFirstMatch(m) is None
+            except Exception:
+                return True
+
+        _budget = self.max_dock_per_pathway
+        _pool = [(e, e.get("mol")) for e in top_evolved if _passes_frag_triage(e.get("mol"))]
+        _pool.sort(key=lambda x: x[0].get("score", 0), reverse=True)
+        top_evolved_dock = [e for e, _ in _pool[:_budget]]
+        if not top_evolved_dock:
+            top_evolved_dock = sorted(top_evolved, key=lambda x: x.get("score", 0), reverse=True)[:_budget]
+
+        # Dock evolved molecules (budget-capped)
         if progress_callback:
-            progress_callback(0.5, f"⚗️ Docking {min(len(top_evolved), 500)} fragment-derived molecules...")
-        
-        dock_mols = [e["mol"] for e in top_evolved[:500]]
-        dock_smiles = [e["smiles"] for e in top_evolved[:500]]
-        
+            progress_callback(0.5, f"⚗️ Docking {len(top_evolved_dock)} fragment-derived molecules (budget ≤{_budget})...")
+
+        dock_mols   = [e["mol"]    for e in top_evolved_dock]
+        dock_smiles = [e["smiles"] for e in top_evolved_dock]
+
         center, box = detect_binding_site(self.pdb_block)
         self.fragment_docking = dock_batch(
             dock_mols, dock_smiles, self.pdb_block,
             center=center, box_size=self.box_size,
             exhaustiveness=self.exhaustiveness,
             num_modes=self.num_modes,
-            max_molecules=500,
+            max_molecules=_budget,
             progress_callback=lambda c, t: progress_callback(
                 0.5 + 0.3 * c / max(t, 1), f"Docking fragment {c}/{t}") if progress_callback else None,
         )
+
+        docked_source = top_evolved_dock  # for downstream indexing
         
         # Get top 20 by docking score
         docked_with_info = []
         for i, dock_res in enumerate(self.fragment_docking):
-            if i < len(top_evolved):
-                info = top_evolved[i].copy()
-                info["docking_score"] = dock_res.get("best_score", 0.0)
-                info["docking_poses"] = dock_res.get("scores", [])
+            if i < len(docked_source):
+                info = docked_source[i].copy()
+                info["docking_score"]  = dock_res.get("best_score", 0.0)
+                info["docking_poses"]  = dock_res.get("scores", [])
                 info["docking_method"] = dock_res.get("method", "unknown")
                 docked_with_info.append(info)
         
@@ -323,7 +349,7 @@ class HybridPipeline:
             score_fn=self._score_fn,
             active_smiles=self.active_smiles,
             classifier_threshold=self.db_threshold,
-            top_n=500,
+            top_n=100,   # was 500
             progress_callback=lambda s, m: progress_callback(s * 0.5, m) if progress_callback else None,
         )
         
@@ -342,39 +368,64 @@ class HybridPipeline:
                             f"Lowered to {fallback_thresh} → {len(fallback)} hits."
                         )
                         fallback.sort(key=lambda x: x.get("classifier_score", 0), reverse=True)
-                        top_db_hits = fallback[:500]
+                        top_db_hits = fallback[:100]   # cap at 100
                         break
                 else:
-                    # Take top N by score regardless
-                    logger.warning("Taking top 500 DB hits by classifier score regardless of threshold.")
+                    logger.warning("Taking top 100 DB hits by classifier score regardless of threshold.")
                     all_hits.sort(key=lambda x: x.get("classifier_score", 0), reverse=True)
-                    top_db_hits = all_hits[:500]
-        
-        # Dock top database hits
+                    top_db_hits = all_hits[:100]
+
+        # ── Pre-docking triage: Ro5 + PAINS for DB hits ──
+        from rdkit.Chem import Descriptors as _D2, rdMolDescriptors as _RD2, FilterCatalog as _FC2
+        _pp2 = _FC2.FilterCatalogParams()
+        _pp2.AddCatalog(_FC2.FilterCatalogParams.FilterCatalogs.PAINS)
+        _pains2 = _FC2.FilterCatalog(_pp2)
+        def _triage_db(h):
+            m = h.get("mol") or Chem.MolFromSmiles(h.get("smiles", ""))
+            if m is None:
+                return False
+            try:
+                v = sum([_D2.MolWt(m) > 550, _D2.MolLogP(m) > 5.5,
+                         _RD2.CalcNumHBD(m) > 5, _RD2.CalcNumHBA(m) > 10])
+                return v == 0 and _pains2.GetFirstMatch(m) is None
+            except Exception:
+                return True
+
+        _budget_db = self.max_dock_per_pathway
+        db_pool = sorted(
+            [h for h in top_db_hits if _triage_db(h)],
+            key=lambda x: x.get("classifier_score", 0), reverse=True
+        )[:_budget_db]
+        if not db_pool:
+            db_pool = sorted(top_db_hits, key=lambda x: x.get("classifier_score", 0), reverse=True)[:_budget_db]
+
+        # Dock database hits (budget-capped)
         if progress_callback:
-            progress_callback(0.5, f"⚗️ Docking {min(len(top_db_hits), 500)} database hits...")
-        
-        dock_mols = [h.get("mol") or Chem.MolFromSmiles(h["smiles"]) for h in top_db_hits[:500]]
-        dock_smiles = [h.get("smiles", "") for h in top_db_hits[:500]]
-        
+            progress_callback(0.5, f"⚗️ Docking {len(db_pool)} database hits (budget ≤{_budget_db})...")
+
+        dock_mols   = [h.get("mol") or Chem.MolFromSmiles(h["smiles"]) for h in db_pool]
+        dock_smiles = [h.get("smiles", "") for h in db_pool]
+
         center, box = detect_binding_site(self.pdb_block)
         self.database_docking = dock_batch(
             dock_mols, dock_smiles, self.pdb_block,
             center=center, box_size=self.box_size,
             exhaustiveness=self.exhaustiveness,
             num_modes=self.num_modes,
-            max_molecules=500,
+            max_molecules=_budget_db,
             progress_callback=lambda c, t: progress_callback(
                 0.5 + 0.3 * c / max(t, 1), f"Docking DB hit {c}/{t}") if progress_callback else None,
         )
+
+        db_docked_source = db_pool  # for downstream indexing
         
         # Get top 20 by docking score
         docked_db = []
         for i, dock_res in enumerate(self.database_docking):
-            if i < len(top_db_hits):
-                info = top_db_hits[i].copy()
-                info["docking_score"] = dock_res.get("best_score", 0.0)
-                info["docking_poses"] = dock_res.get("scores", [])
+            if i < len(db_docked_source):
+                info = db_docked_source[i].copy()
+                info["docking_score"]  = dock_res.get("best_score", 0.0)
+                info["docking_poses"]  = dock_res.get("scores", [])
                 info["docking_method"] = dock_res.get("method", "unknown")
                 docked_db.append(info)
         

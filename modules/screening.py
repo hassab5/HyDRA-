@@ -12,7 +12,7 @@ Includes:
   - Async HTTP calls with httpx
   - InChIKey deduplication
   - Graceful failure handling
-  - Fallback molecule set (20,000+)
+  - Fallback molecule set (500 — capped for HF Spaces CPU budget)
 """
 
 import logging
@@ -295,7 +295,7 @@ def deduplicate_by_inchikey(hits):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  FALLBACK MOLECULE LIBRARY (20,000+)
+#  FALLBACK MOLECULE LIBRARY (500 — capped for HF Spaces)
 # ═══════════════════════════════════════════════════════════════
 
 # Core drug scaffolds for generating fallback molecules
@@ -342,9 +342,9 @@ DRUG_SUBSTITUENTS = [
 ]
 
 
-def generate_fallback_molecules(n_target=20000):
+def generate_fallback_molecules(n_target=500):
     """Generate a diverse set of drug-like molecules for fallback screening.
-    Produces 20,000+ unique, valid drug-like SMILES."""
+    Capped at 500 by default to keep runtime manageable on CPU-only HF Spaces."""
     
     logger.info(f"Generating {n_target} fallback molecules...")
     
@@ -416,8 +416,8 @@ def screen_databases(
     pharmacophore_features,
     pharmacophore_json,
     active_smiles=None,
-    max_per_source=3000,
-    max_total=10000,
+    max_per_source=500,
+    max_total=1000,
     progress_callback=None,
 ):
     """Run multi-database screening pipeline.
@@ -493,9 +493,9 @@ def screen_databases(
     
     # If insufficient results, use fallback library
     if len(unique_hits) < 100:
-        update_progress(0.8, "APIs returned few results, generating fallback library (20,000+ molecules)...")
-        logger.info("Generating fallback molecule library...")
-        fallback = generate_fallback_molecules(20000)
+        update_progress(0.8, "APIs returned few results, generating fallback library (500 molecules)...")
+        logger.info("Generating fallback molecule library (capped at 500)...")
+        fallback = generate_fallback_molecules(500)
         
         # ADD ACTIVES TO FALLBACK SO PIPELINE DOES NOT HALT
         if active_smiles:
@@ -531,7 +531,7 @@ def run_database_pathway(
     score_fn,
     active_smiles=None,
     classifier_threshold=0.80,
-    top_n=500,
+    top_n=100,
     progress_callback=None,
 ):
     """Run complete database screening pathway.
