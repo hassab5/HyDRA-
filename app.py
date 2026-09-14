@@ -379,7 +379,11 @@ with tabs[0]:
     with bc1:
         demo_btn = st.button("🧪 EGFR Demo", use_container_width=True, disabled=is_running, key="demo_btn")
     with bc2:
-        run_label = "▶️ Resume" if is_paused else ("▶️ Run Pipeline" if not is_done else "🔁 Re-run")
+        # Show Resume if pipeline has incomplete progress (step 1-4)
+        _has_progress = (st.session_state.pipeline is not None
+                         and 0 < st.session_state.pipeline_step < 5)
+        run_label = ("▶️ Resume" if _has_progress else
+                     ("▶️ Run Pipeline" if not is_done else "🔁 Re-run"))
         run_btn = st.button(run_label, use_container_width=True, type="primary", disabled=is_running, key="run_btn")
     with bc3:
         pause_btn = st.button("⏸️ Pause", use_container_width=True, disabled=not is_running, key="pause_btn")
@@ -407,12 +411,22 @@ with tabs[0]:
 
     if run_btn and not is_running:
         error_msg = None
+        # ── RESUME vs FRESH RUN ──
+        # Key fix: use pipeline_step (always reliable) instead of is_paused
+        # (which can be False due to Streamlit rerun race conditions).
+        has_progress = (
+            st.session_state.pipeline is not None
+            and st.session_state.pipeline_step > 0
+            and st.session_state.pipeline_step < 5
+        )
 
-        if is_paused and st.session_state.pipeline is not None:
-            # Resume: reuse existing pipeline object
-            pass
+        if has_progress:
+            # ── RESUME: reuse existing pipeline, continue from saved step ──
+            logger.info(f"RESUME from step {st.session_state.pipeline_step}")
+            st.toast(f"▶️ Resuming from step {st.session_state.pipeline_step}/4 "
+                     f"({STEP_LABELS.get(st.session_state.pipeline_step, '')})")
         else:
-            # Fresh run: gather inputs
+            # ── FRESH RUN: gather inputs, create new pipeline ──
             active_mols, active_smiles, pdb_block, pharmit_json, frag_path = [], [], "", None, None
 
             if getattr(st.session_state, "demo_mols", None):
@@ -465,6 +479,7 @@ with tabs[0]:
                 for k in ["dl_frag_csv","dl_db_csv","dl_combined_csv","dl_admet_csv",
                           "dl_origins_csv","dl_docking_csv","dl_pharm_json","dl_viewer_html","dl_zip"]:
                     st.session_state[k] = None
+                logger.info("FRESH RUN: new pipeline created")
 
         if error_msg:
             st.error(f"❌ {error_msg}")
@@ -472,7 +487,7 @@ with tabs[0]:
             st.session_state.pipeline_paused  = False
             st.session_state.pause_requested  = False
             st.session_state.do_advance       = True
-            st.rerun()   # rerun so the step tracker shows "step 0 = running"
+            st.rerun()
 
     # ══════════════════════════════════════════════════════════
     # AUTO-ADVANCE — runs INSIDE tabs[0], AFTER all UI elements
