@@ -12,8 +12,6 @@ import json
 import io
 import os
 import logging
-import threading
-import plotly.graph_objects as go
 import plotly.express as px
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
@@ -96,32 +94,56 @@ h1, h2, h3 { font-family: 'Inter', sans-serif !important; }
     border-radius: 16px; padding: 24px; backdrop-filter: blur(12px);
     margin-bottom: 1rem;
 }
-.stat-badge {
-    display: inline-block; padding: 4px 12px; border-radius: 20px;
-    font-size: 0.8rem; font-weight: 600;
-    background: rgba(99,102,241,0.15); color: #818cf8;
+.step-banner {
+    background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.3);
+    border-radius: 10px; padding: 10px 18px; margin: 6px 0; color: #22d3ee;
 }
 .pause-banner {
-    background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.4);
-    border-radius: 12px; padding: 12px 20px; margin: 8px 0;
-    color: #fbbf24; font-weight: 600;
+    background: rgba(251,191,36,0.10); border: 1px solid rgba(251,191,36,0.4);
+    border-radius: 10px; padding: 10px 18px; margin: 6px 0; color: #fbbf24; font-weight: 600;
+}
+.done-banner {
+    background: rgba(16,185,129,0.10); border: 1px solid rgba(16,185,129,0.4);
+    border-radius: 10px; padding: 10px 18px; margin: 6px 0; color: #10b981; font-weight: 600;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── SESSION STATE INIT ───────────────────────────────────────
+# ═══════════════════════════════════════════════════
+#  SESSION STATE INIT
+# ═══════════════════════════════════════════════════
+_STEP_NAMES = {
+    0: "Not started",
+    1: "Pharmacophore built",
+    2: "Classifier trained",
+    3: "Fragment screening done",
+    4: "Database screening done",
+    5: "Complete",
+}
+_STEP_COUNT = 4  # steps 1-4
+
 def _init_state():
     defaults = {
+        # Pipeline object
         "pipeline": None,
-        "pipeline_run": False,
-        "pipeline_running": False,
-        "pipeline_paused": False,
-        "pipeline_step": 0,          # 0=not started, 1=pharm, 2=clf, 3=fbdd, 4=db, 5=done
+        # Status flags
+        "pipeline_run": False,       # fully complete
+        "pipeline_running": False,   # currently in a step
+        "pipeline_paused": False,    # paused between steps
+        "pipeline_step": 0,          # 0=not started … 5=done
         "pipeline_error": None,
-        "stop_event": None,
-        "progress": 0.0,
-        "status_msg": "",
-        # Cached download data — pre-generated after pipeline completes
+        # Pause signal: set by Pause button, checked between steps
+        "pause_requested": False,
+        # Auto-advance: set True to trigger next step on rerun
+        "pipeline_auto_advance": False,
+        # Input cache (so resume doesn't need uploads again)
+        "cached_active_mols": None,
+        "cached_active_smiles": None,
+        "cached_pdb_block": None,
+        "cached_pharmit_json": None,
+        "cached_frag_path": None,
+        "cached_params": None,
+        # Download cache — pre-generated after completion
         "dl_frag_csv": None,
         "dl_db_csv": None,
         "dl_combined_csv": None,
@@ -140,66 +162,43 @@ _init_state()
 
 # ─── DEMO DATA ──────────────────────────────────────────────
 EGFR_DEMO_SMILES = [
-    "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1",  # Gefitinib
-    "C#Cc1cccc(Nc2ncnc3cc(OCCOC)c(OCCOC)cc23)c1",        # Erlotinib
-    "CS(=O)(=O)CCNCc1ccc(-c2ccc3ncnc(Nc4ccc(OCc5cccc(F)c5)c(Cl)c4)c3c2)o1",  # Lapatinib
-    "COc1cc2c(Nc3ccc(Br)cc3F)ncnc2cc1OCC1CCN(C)CC1",    # Vandetanib
-    "C=CC(=O)Nc1cc(Nc2nccc(-c3cn(C)c4ccccc34)n2)c(OC)cc1N(C)CCN(C)C",  # Osimertinib
+    "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1",
+    "C#Cc1cccc(Nc2ncnc3cc(OCCOC)c(OCCOC)cc23)c1",
+    "CS(=O)(=O)CCNCc1ccc(-c2ccc3ncnc(Nc4ccc(OCc5cccc(F)c5)c(Cl)c4)c3c2)o1",
+    "COc1cc2c(Nc3ccc(Br)cc3F)ncnc2cc1OCC1CCN(C)CC1",
+    "C=CC(=O)Nc1cc(Nc2nccc(-c3cn(C)c4ccccc34)n2)c(OC)cc1N(C)CCN(C)C",
     "Nc1ccc(-c2cc3c(Nc4cccc(Cl)c4)ncnc3[nH]2)cc1",
     "COc1cc(Nc2ncnc3cc(OC)c(OC)cc23)ccc1NC(=O)C=C",
     "c1ccc(Nc2ncnc3ccccc23)cc1",
 ]
-
 EGFR_DEMO_PDB = """HEADER    TRANSFERASE                             01-JUL-03   1M17
 TITLE     CRYSTAL STRUCTURE OF EGFR KINASE DOMAIN (DEMO EXCERPT)
 ATOM      1  N   MET A  696      18.168  54.537  36.088  1.00 41.78           N
 ATOM      2  CA  MET A  696      18.399  53.816  34.827  1.00 41.03           C
 ATOM      3  C   MET A  696      19.886  53.747  34.555  1.00 39.52           C
 ATOM      4  O   MET A  696      20.594  54.748  34.599  1.00 40.57           O
-ATOM      5  CB  MET A  696      17.621  54.463  33.686  1.00 42.39           C
 ATOM     20  N   LEU A  718      25.898  51.312  30.088  1.00 29.80           N
 ATOM     21  CA  LEU A  718      26.645  50.225  29.490  1.00 28.18           C
-ATOM     22  C   LEU A  718      28.061  50.706  29.196  1.00 28.30           C
-ATOM     23  O   LEU A  718      28.256  51.757  28.581  1.00 26.23           O
 ATOM     30  N   VAL A  726      29.128  48.013  25.800  1.00 23.71           N
 ATOM     31  CA  VAL A  726      30.003  47.291  24.882  1.00 22.55           C
-ATOM     32  C   VAL A  726      31.478  47.456  25.223  1.00 23.84           C
-ATOM     33  O   VAL A  726      31.804  47.876  26.337  1.00 23.31           O
 ATOM     40  N   ALA A  743      31.250  44.188  22.395  1.00 18.43           N
 ATOM     41  CA  ALA A  743      31.750  42.835  22.264  1.00 18.62           C
 ATOM     50  N   LYS A  745      33.680  42.003  23.775  1.00 20.74           N
-ATOM     51  CA  LYS A  745      34.556  40.868  23.495  1.00 21.18           C
-ATOM     52  C   LYS A  745      35.952  41.344  23.102  1.00 22.28           C
 ATOM     60  N   THR A  790      30.851  42.810  18.085  1.00 18.75           N
 ATOM     61  CA  THR A  790      30.180  41.612  17.593  1.00 18.07           C
-ATOM     62  C   THR A  790      30.875  40.323  18.022  1.00 18.28           C
-ATOM     63  O   THR A  790      30.274  39.262  17.896  1.00 20.14           O
 ATOM     70  N   MET A  793      32.621  38.723  19.105  1.00 17.63           N
-ATOM     71  CA  MET A  793      33.271  37.473  18.729  1.00 17.22           C
 ATOM     80  N   LEU A  788      28.512  44.150  17.655  1.00 19.56           N
-ATOM     81  CA  LEU A  788      27.775  43.116  18.364  1.00 18.15           C
 ATOM     90  N   ASP A  855      27.115  38.965  23.200  1.00 20.95           N
-ATOM     91  CA  ASP A  855      26.412  37.801  23.715  1.00 21.97           C
-ATOM     92  C   ASP A  855      25.105  37.527  22.973  1.00 22.64           C
 ATOM    100  N   PHE A  856      24.831  38.230  21.881  1.00 20.42           N
-ATOM    101  CA  PHE A  856      23.593  38.027  21.130  1.00 20.11           C
 ATOM    110  N   GLU A  762      36.221  44.862  20.042  1.00 21.78           N
-ATOM    111  CA  GLU A  762      36.688  44.095  18.891  1.00 22.23           C
 ATOM    120  N   ARG A  841      22.985  40.352  25.610  1.00 26.51           N
-ATOM    121  CA  ARG A  841      21.785  39.679  26.095  1.00 28.83           C
 ATOM    130  N   TRP A  880      24.112  35.525  27.180  1.00 20.06           N
-ATOM    131  CA  TRP A  880      23.558  34.266  27.677  1.00 20.18           C
 ATOM    140  N   TYR A  869      27.812  33.245  24.388  1.00 18.43           N
-ATOM    141  CA  TYR A  869      27.255  31.988  23.882  1.00 18.68           C
 ATOM    150  N   HIS A  781      26.050  47.218  15.330  1.00 21.22           N
-ATOM    151  CA  HIS A  781      25.255  46.188  14.680  1.00 20.94           C
 HETATM  200  C1  ERL A  900      28.500  42.100  20.500  1.00 15.00           C
 HETATM  201  C2  ERL A  900      29.200  41.300  21.200  1.00 15.00           C
 HETATM  202  N1  ERL A  900      30.100  40.800  20.400  1.00 15.00           N
 HETATM  203  C3  ERL A  900      30.500  41.200  19.200  1.00 15.00           C
-HETATM  204  N2  ERL A  900      29.800  42.000  18.500  1.00 15.00           N
-HETATM  205  C4  ERL A  900      28.900  42.500  19.200  1.00 15.00           C
-HETATM  206  O1  ERL A  900      27.400  43.100  22.100  1.00 15.00           O
 HETATM  207  O2  ERL A  900      31.500  40.500  18.500  1.00 15.00           O
 END
 """
@@ -223,14 +222,14 @@ def mol_to_png_bytes(smi, size=(300, 200)):
         return None
     img = Draw.MolToImage(mol, size=size)
     buf = io.BytesIO()
-    img.save(buf, format='PNG')
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-# ─── DOWNLOAD CACHE BUILDER ──────────────────────────────────
+# ─── DOWNLOAD CACHE ───────────────────────────────────────────
 def _cache_downloads(pipeline):
-    """Pre-generate all download data and store in session_state.
-    Called once after pipeline completes so downloads never trigger re-execution."""
+    """Pre-generate all download data once, stored in session_state.
+    Downloads tab reads these keys — never calls pipeline methods directly."""
     try:
         st.session_state.dl_frag_csv     = pipeline.export_fragment_results_csv()
         st.session_state.dl_db_csv       = pipeline.export_database_results_csv()
@@ -240,68 +239,109 @@ def _cache_downloads(pipeline):
         st.session_state.dl_docking_csv  = pipeline.export_docking_scores_csv()
         st.session_state.dl_pharm_json   = pipeline.export_pharmacophore_json()
         st.session_state.dl_viewer_html  = pipeline.export_viewer_html()
-        # Pre-generate ZIP too
         try:
             st.session_state.dl_zip = pipeline.create_zip()
         except Exception as e:
             logger.warning(f"ZIP pre-generation failed: {e}")
-            st.session_state.dl_zip = None
     except Exception as e:
-        logger.error(f"Download cache build failed: {e}")
+        logger.error(f"Download cache failed: {e}")
 
 
-# ─── PIPELINE RUNNER (threaded) ───────────────────────────────
-class PipelineInterrupted(Exception):
-    def __init__(self, step: int):
-        self.step = step
-        super().__init__(f"Pipeline paused after step {step}")
+# ═══════════════════════════════════════════════════
+#  CORE STEP RUNNER  (no threading — runs synchronously)
+# ═══════════════════════════════════════════════════
+def _run_current_step(pipeline, bar, txt):
+    """
+    Run exactly ONE pipeline step synchronously.
+    Progress bar and status text are updated live via callback.
 
+    Returns:
+        "done"    → pipeline fully complete
+        "paused"  → user requested pause; state is saved
+        "running" → step finished, more steps remain (caller should rerun)
+        "error"   → exception occurred
+    """
+    step = st.session_state.pipeline_step
 
-def _run_pipeline_thread(pipeline, stop_event, progress_holder):
-    """Runs pipeline steps with pause-checkpoints between each step.
-    Stores partial state back into session_state-compatible dict."""
+    def cb(frac, msg):
+        """Live progress update — called from within the step function."""
+        bar.progress(min(float(frac), 1.0))
+        txt.markdown(f"**{msg}**")
+
     try:
-        def cb(frac, msg):
-            progress_holder["progress"] = frac
-            progress_holder["msg"] = msg
+        if step == 0:
+            cb(0.00, "🔬 Step 1/4 — Building pharmacophore model…")
+            pipeline.step0_pharmacophore(lambda f, m: cb(f * 0.10, m))
+            st.session_state.pipeline_step = 1
 
-        # Step 0: Pharmacophore
-        progress_holder["step"] = 1
-        pipeline.step0_pharmacophore(lambda f, m: cb(f * 0.10, m))
-        if stop_event.is_set():
-            raise PipelineInterrupted(1)
+        elif step == 1:
+            cb(0.10, "🤖 Step 2/4 — Training ML classifier…")
+            pipeline.step1_classifier(lambda f, m: cb(0.10 + f * 0.10, m))
+            st.session_state.pipeline_step = 2
 
-        # Step 1: Classifier
-        progress_holder["step"] = 2
-        pipeline.step1_classifier(lambda f, m: cb(0.10 + f * 0.10, m))
-        if stop_event.is_set():
-            raise PipelineInterrupted(2)
+        elif step == 2:
+            cb(0.20, "🧬 Step 3/4 — Fragment-based drug design…")
+            pipeline.pathway1_fbdd(lambda f, m: cb(0.20 + f * 0.35, m))
+            st.session_state.pipeline_step = 3
 
-        # Step 2: FBDD
-        progress_holder["step"] = 3
-        pipeline.pathway1_fbdd(lambda f, m: cb(0.20 + f * 0.35, m))
-        if stop_event.is_set():
-            raise PipelineInterrupted(3)
+        elif step == 3:
+            cb(0.55, "🗄️ Step 4/4 — Database screening & docking…")
+            pipeline.pathway2_screening(lambda f, m: cb(0.55 + f * 0.35, m))
+            st.session_state.pipeline_step = 4
 
-        # Step 3: Database Screening
-        progress_holder["step"] = 4
-        pipeline.pathway2_screening(lambda f, m: cb(0.55 + f * 0.35, m))
-        if stop_event.is_set():
-            raise PipelineInterrupted(4)
+        elif step == 4:
+            cb(0.92, "📊 Combining results from both pathways…")
+            pipeline.combine_results()
+            cb(1.00, "✅ Pipeline complete!")
+            st.session_state.pipeline_step = 5
+            # Pipeline done
+            st.session_state.pipeline_run     = True
+            st.session_state.pipeline_running = False
+            st.session_state.pipeline_paused  = False
+            _cache_downloads(pipeline)
+            return "done"
 
-        # Step 4: Combine
-        progress_holder["step"] = 5
-        cb(0.92, "📊 Combining results from both pathways...")
-        pipeline.combine_results()
-        cb(1.0, "✅ Pipeline complete!")
-        progress_holder["done"] = True
+        # Step finished — check if pause was requested
+        if st.session_state.pause_requested:
+            st.session_state.pause_requested  = False
+            st.session_state.pipeline_paused  = True
+            st.session_state.pipeline_running = False
+            current = st.session_state.pipeline_step
+            cb(current / 5, f"⏸️ Paused — {_STEP_NAMES.get(current, '')} complete")
+            return "paused"
 
-    except PipelineInterrupted as e:
-        progress_holder["paused"] = True
-        progress_holder["paused_step"] = e.step
+        return "running"
+
     except Exception as e:
-        progress_holder["error"] = str(e)
-        logger.exception("Pipeline thread error")
+        logger.exception("Pipeline step error")
+        st.session_state.pipeline_running = False
+        st.session_state.pipeline_error   = str(e)
+        return "error"
+
+
+# ═══════════════════════════════════════════════════
+#  AUTO-ADVANCE LOGIC  (top of script, before sidebar)
+# ═══════════════════════════════════════════════════
+# If auto_advance is set, run the next step immediately on this rerun.
+# This creates a "self-advancing" loop: each step triggers the next rerun.
+_auto_bar = None
+_auto_txt = None
+
+if st.session_state.pipeline_auto_advance and not st.session_state.pipeline_paused:
+    st.session_state.pipeline_auto_advance = False
+    pipeline = st.session_state.pipeline
+    if pipeline and st.session_state.pipeline_step < 5:
+        # Create live placeholders for progress
+        _auto_bar = st.empty()
+        _auto_txt = st.empty()
+        bar = _auto_bar.progress(st.session_state.pipeline_step / 5)
+        txt = _auto_txt.empty()
+        result = _run_current_step(pipeline, bar, txt)
+        if result == "running":
+            # More steps — trigger another rerun
+            st.session_state.pipeline_auto_advance = True
+        # rerun to refresh full UI state
+        st.rerun()
 
 
 # ═══════════════════════════════════════════════════
@@ -313,27 +353,37 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### ⚙️ Pipeline Parameters")
-    exhaustiveness = st.slider("Docking Exhaustiveness", 1, 32, 4, help="Higher = more accurate but slower")
+    exhaustiveness = st.slider("Docking Exhaustiveness", 1, 16, 4,
+                               help="Higher = more accurate but slower. Capped at 16 for HF Spaces CPU.")
     box_x = st.slider("Box Size X (Å)", 10.0, 40.0, 20.0)
     box_y = st.slider("Box Size Y (Å)", 10.0, 40.0, 20.0)
     box_z = st.slider("Box Size Z (Å)", 10.0, 40.0, 20.0)
-    frag_thresh  = st.slider("Fragment Classifier Threshold", 0.5, 1.0, 0.70, 0.05)
-    evolved_thresh = st.slider("Evolved Mol Threshold", 0.5, 1.0, 0.80, 0.05)
-    db_thresh    = st.slider("Database Hit Threshold", 0.5, 1.0, 0.80, 0.05)
+    frag_thresh    = st.slider("Fragment Classifier Threshold", 0.5, 1.0, 0.70, 0.05)
+    evolved_thresh = st.slider("Evolved Mol Threshold",        0.5, 1.0, 0.80, 0.05)
+    db_thresh      = st.slider("Database Hit Threshold",       0.5, 1.0, 0.80, 0.05)
 
     st.divider()
     st.markdown("### 📊 Pipeline Status")
 
-    # ── Reliable status display ──
+    step = st.session_state.pipeline_step
+
     if st.session_state.pipeline_running:
-        st.warning("⚙️ Pipeline is running…")
+        st.warning("⚙️ Pipeline running…")
+        # Step progress indicator
+        for s in range(1, 6):
+            icon = "✅" if s < step else ("🔄" if s == step else "⬜")
+            name = {1:"Pharmacophore", 2:"Classifier", 3:"FBDD", 4:"DB Screening", 5:"Combine"}[s]
+            st.caption(f"{icon} {name}")
+
     elif st.session_state.pipeline_paused:
         st.markdown('<div class="pause-banner">⏸️ Pipeline paused</div>', unsafe_allow_html=True)
-        step_names = {1: "Pharmacophore", 2: "Classifier", 3: "FBDD", 4: "Database", 5: "Done"}
-        paused_at = st.session_state.get("pipeline_step", 0)
-        st.caption(f"Paused after: **{step_names.get(paused_at, 'Unknown')}**")
+        for s in range(1, 6):
+            icon = "✅" if s < step else ("⏸️" if s == step else "⬜")
+            name = {1:"Pharmacophore", 2:"Classifier", 3:"FBDD", 4:"DB Screening", 5:"Combine"}[s]
+            st.caption(f"{icon} {name}")
+
     elif st.session_state.pipeline_run:
-        st.success("✅ Pipeline completed")
+        st.markdown('<div class="done-banner">✅ Pipeline complete</div>', unsafe_allow_html=True)
         pipeline = st.session_state.pipeline
         if pipeline:
             try:
@@ -344,8 +394,10 @@ with st.sidebar:
                 st.metric("Total Leads",     summary["combined"]["n_total_leads"])
             except Exception:
                 pass
+
     elif st.session_state.pipeline_error:
         st.error(f"❌ {st.session_state.pipeline_error}")
+
     else:
         st.info("⏳ Pipeline not yet run")
 
@@ -367,281 +419,212 @@ with tabs[0]:
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### 📁 Required Input")
-        pdb_file = st.file_uploader("Protein Structure (.pdb) — **REQUIRED**", type=["pdb"], key="pdb_upload")
+        pdb_file = st.file_uploader("Protein Structure (.pdb) — **REQUIRED**",
+                                    type=["pdb"], key="pdb_upload",
+                                    disabled=st.session_state.pipeline_running)
         st.markdown("#### 📁 Active Compounds")
-        actives_file = st.file_uploader("Known Binders (.smi, .sdf, .txt)", type=["smi", "sdf", "txt"], key="actives_upload")
+        actives_file = st.file_uploader("Known Binders (.smi, .sdf, .txt)",
+                                        type=["smi","sdf","txt"], key="actives_upload",
+                                        disabled=st.session_state.pipeline_running)
 
     with col2:
         st.markdown("#### 📁 Optional Inputs")
-        fragment_file = st.file_uploader("Custom Fragment Library (.sdf)", type=["sdf"], key="frag_upload")
+        fragment_file = st.file_uploader("Custom Fragment Library (.sdf)",
+                                         type=["sdf"], key="frag_upload",
+                                         disabled=st.session_state.pipeline_running)
         st.markdown("#### 📁 Upload Pharmacophore")
         pharmit_file = st.file_uploader(
-            "Pharmacophore Model (multiple formats supported)",
-            type=["json", "ph4", "lig", "pml", "mol2", "xyz", "csv", "txt", "sdf", "tsv"],
+            "Pharmacophore Model (multiple formats)",
+            type=["json","ph4","lig","pml","mol2","xyz","csv","txt","sdf","tsv"],
             key="pharmit_upload",
-            help="Supported formats: Pharmit JSON, MOE .ph4, .lig, PyMOL .pml, .mol2, .xyz, CSV/TSV/TXT, SDF"
+            disabled=st.session_state.pipeline_running,
+            help="Supported: Pharmit JSON, MOE .ph4/.lig, PyMOL .pml, .mol2, .xyz, CSV/TSV/TXT, SDF"
         )
         st.markdown("""
-        <div class="card" style="border-left: 3px solid #6366f1;">
+        <div class="card" style="border-left:3px solid #6366f1;">
             <strong>🌐 Pharmit Web Server</strong><br>
-            <small>Create, visualize, and search pharmacophore models online:</small><br>
+            <small>Create & search pharmacophore models online:</small><br>
             <a href="https://pharmit.csb.pitt.edu" target="_blank"
-               style="color: #22d3ee; text-decoration: none; font-weight: 600;">
-                🔗 https://pharmit.csb.pitt.edu
+               style="color:#22d3ee;text-decoration:none;font-weight:600;">
+                🔗 pharmit.csb.pitt.edu
             </a>
         </div>
         """, unsafe_allow_html=True)
 
     st.divider()
 
-    # ── Live progress area (only shown while running or paused) ──
-    progress_bar_placeholder = st.empty()
-    status_text_placeholder  = st.empty()
-    pause_banner_placeholder = st.empty()
+    # ── Step tracker display ──────────────────────────────────
+    step = st.session_state.pipeline_step
+    if step > 0:
+        step_cols = st.columns(5)
+        step_info = [
+            ("🔬", "Pharmacophore"),
+            ("🤖", "Classifier"),
+            ("🧬", "FBDD"),
+            ("🗄️", "DB Screen"),
+            ("📊", "Combine"),
+        ]
+        for i, (icon, name) in enumerate(step_info, start=1):
+            with step_cols[i - 1]:
+                if i < step:
+                    st.success(f"{icon} {name}\n\n✅ Done")
+                elif i == step and st.session_state.pipeline_running:
+                    st.warning(f"{icon} {name}\n\n🔄 Running…")
+                elif i == step and st.session_state.pipeline_paused:
+                    st.warning(f"{icon} {name}\n\n⏸️ Paused")
+                else:
+                    st.markdown(f"""
+                    <div style="border:1px solid #1e293b;border-radius:8px;padding:10px;text-align:center;color:#64748b;">
+                    {icon} {name}<br><small>⬜ Pending</small>
+                    </div>""", unsafe_allow_html=True)
+        st.divider()
 
-    # Show progress if running/paused
-    if st.session_state.pipeline_running or st.session_state.pipeline_paused:
-        prog = st.session_state.get("progress", 0.0)
-        msg  = st.session_state.get("status_msg", "")
-        progress_bar_placeholder.progress(min(float(prog), 1.0))
-        status_text_placeholder.markdown(f"**{msg}**")
+    # ── Progress bar (always visible when running or paused) ──
+    prog_bar  = st.empty()
+    prog_text = st.empty()
 
-    col_demo, col_run, col_ctrl, col_est = st.columns([1, 1, 1, 1])
+    if st.session_state.pipeline_running:
+        prog_bar.progress(min(step / 5, 1.0))
+        prog_text.markdown(f"**🔄 Step {step}/4 in progress…**")
+    elif st.session_state.pipeline_paused:
+        prog_bar.progress(min(step / 5, 1.0))
+        prog_text.markdown(f'<div class="pause-banner">⏸️ Paused after: {_STEP_NAMES.get(step, "")} — click ▶️ Resume to continue</div>', unsafe_allow_html=True)
+    elif st.session_state.pipeline_run:
+        prog_bar.progress(1.0)
+        prog_text.markdown('<div class="done-banner">✅ Pipeline complete! Check the tabs above for results.</div>', unsafe_allow_html=True)
+
+    # ── Buttons row ──────────────────────────────────────────
+    col_demo, col_run, col_pause, col_reset, col_est = st.columns([1, 1, 1, 1, 1])
 
     with col_demo:
         demo_btn = st.button("🧪 Load EGFR Demo", use_container_width=True, type="secondary",
-                             disabled=st.session_state.pipeline_running)
+                             disabled=st.session_state.pipeline_running,
+                             key="demo_btn")
         if demo_btn:
-            demo_mols, demo_smiles, demo_pdb = load_demo_data()
-            st.session_state.demo_mols    = demo_mols
-            st.session_state.demo_smiles  = demo_smiles
-            st.session_state.demo_pdb     = demo_pdb
-            st.success(f"✅ Loaded {len(demo_mols)} EGFR inhibitors + PDB structure")
-
-    with col_est:
-        st.markdown("""
-        <div class="card">
-        <strong>⏱️ Estimated Runtime</strong><br>
-        <small>~5–15 min (CPU, depending on library size)</small>
-        </div>
-        """, unsafe_allow_html=True)
+            dm, ds, dp = load_demo_data()
+            st.session_state.demo_mols   = dm
+            st.session_state.demo_smiles = ds
+            st.session_state.demo_pdb    = dp
+            st.success(f"Loaded {len(dm)} EGFR inhibitors + PDB")
 
     with col_run:
-        # Determine button states
-        can_run    = not st.session_state.pipeline_running
-        can_resume = st.session_state.pipeline_paused
-
-        if can_resume:
-            run_label = "▶️ Resume Pipeline"
-        else:
-            run_label = "🚀 Run Full Pipeline"
-
+        is_paused = st.session_state.pipeline_paused
+        run_label = "▶️ Resume" if is_paused else (
+                    "▶️ Run Pipeline" if not st.session_state.pipeline_run else "🔁 Re-run")
         run_btn = st.button(run_label, use_container_width=True, type="primary",
                             disabled=st.session_state.pipeline_running,
                             key="run_btn")
 
-    with col_ctrl:
-        pause_btn = st.button(
-            "⏸️ Pause Pipeline",
-            use_container_width=True,
-            type="secondary",
-            disabled=not st.session_state.pipeline_running,
-            key="pause_btn"
-        )
+    with col_pause:
+        pause_btn = st.button("⏸️ Pause", use_container_width=True, type="secondary",
+                              disabled=not st.session_state.pipeline_running,
+                              key="pause_btn")
+        if pause_btn:
+            st.session_state.pause_requested = True
+            st.info("⏸️ Pause requested — will stop after current step finishes.")
 
-    # ── PAUSE handler ──
-    if pause_btn and st.session_state.pipeline_running:
-        if st.session_state.stop_event:
-            st.session_state.stop_event.set()
-        st.info("⏸️ Pause signal sent — pipeline will stop after current step completes.")
+    with col_reset:
+        reset_btn = st.button("🗑️ Reset", use_container_width=True, type="secondary",
+                              disabled=st.session_state.pipeline_running,
+                              key="reset_btn")
+        if reset_btn:
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
 
-    # ── RUN / RESUME handler ──
-    if run_btn and can_run:
-        # Gather inputs
-        active_mols    = []
-        active_smiles  = []
-        pdb_block      = ""
-        pharmit_json   = None
-        frag_path      = None
+    with col_est:
+        st.markdown("""
+        <div class="card" style="text-align:center;">
+        <strong>⏱️ Runtime</strong><br>
+        <small>~5–15 min (CPU)</small>
+        </div>""", unsafe_allow_html=True)
 
-        if hasattr(st.session_state, 'demo_mols') and st.session_state.demo_mols:
-            active_mols   = st.session_state.demo_mols
-            active_smiles = st.session_state.demo_smiles
-            pdb_block     = st.session_state.demo_pdb
+    # ── RUN / RESUME handler ─────────────────────────────────
+    if run_btn:
+        error_msg = None
 
-        if pdb_file:
-            pdb_block = parse_pdb_file(pdb_file.read())
-        if actives_file:
-            content = actives_file.read().decode('utf-8')
-            parsed  = parse_actives_file(content, actives_file.name)
-            active_mols   = [p[0] for p in parsed]
-            active_smiles = [p[1] for p in parsed]
-        if pharmit_file:
-            raw_content     = pharmit_file.read()
-            loaded_features = load_pharmacophore_any_format(raw_content, pharmit_file.name)
-            if loaded_features:
-                from modules.pharmacophore import export_pharmit_json as _export_pj
-                pharmit_json = _export_pj(loaded_features)
-                st.success(f"✅ Loaded {len(loaded_features)} pharmacophore features from {pharmit_file.name}")
-            else:
-                st.warning(f"⚠️ Could not parse pharmacophore from {pharmit_file.name}")
-        if fragment_file:
-            import tempfile as tf
-            tmp = tf.NamedTemporaryFile(suffix='.sdf', delete=False)
-            tmp.write(fragment_file.read())
-            tmp.close()
-            frag_path = tmp.name
-
-        if not pdb_block:
-            st.error("❌ Please upload a PDB file or load demo data first!")
-        elif not active_mols and not pharmit_json:
-            st.error("❌ Please provide active compounds or a pharmacophore JSON!")
+        # If resuming, use cached inputs + existing pipeline
+        if is_paused and st.session_state.pipeline is not None:
+            pipeline = st.session_state.pipeline
         else:
-            # If resuming, re-use existing pipeline; otherwise create fresh
-            if can_resume and st.session_state.pipeline is not None:
-                pipeline = st.session_state.pipeline
-                resume_step = st.session_state.pipeline_step
-                st.info(f"▶️ Resuming from step {resume_step}…")
-            else:
-                resume_step = 0
+            # Gather inputs
+            active_mols   = []
+            active_smiles = []
+            pdb_block     = ""
+            pharmit_json  = None
+            frag_path     = None
+
+            # Demo data
+            if hasattr(st.session_state, "demo_mols") and st.session_state.demo_mols:
+                active_mols   = st.session_state.demo_mols
+                active_smiles = st.session_state.demo_smiles
+                pdb_block     = st.session_state.demo_pdb
+
+            # File uploads override demo
+            if pdb_file:
+                pdb_block = parse_pdb_file(pdb_file.read())
+            if actives_file:
+                content   = actives_file.read().decode("utf-8")
+                parsed    = parse_actives_file(content, actives_file.name)
+                active_mols   = [p[0] for p in parsed]
+                active_smiles = [p[1] for p in parsed]
+            if pharmit_file:
+                raw = pharmit_file.read()
+                feats = load_pharmacophore_any_format(raw, pharmit_file.name)
+                if feats:
+                    from modules.pharmacophore import export_pharmit_json as _epj
+                    pharmit_json = _epj(feats)
+                    st.success(f"Loaded {len(feats)} pharmacophore features")
+                else:
+                    st.warning("Could not parse pharmacophore file.")
+            if fragment_file:
+                import tempfile as _tf
+                tmp = _tf.NamedTemporaryFile(suffix=".sdf", delete=False)
+                tmp.write(fragment_file.read())
+                tmp.close()
+                frag_path = tmp.name
+
+            # Validate
+            if not pdb_block:
+                error_msg = "Please upload a PDB file or load demo data first!"
+            elif not active_mols and not pharmit_json:
+                error_msg = "Please provide active compounds or a pharmacophore JSON!"
+
+            if not error_msg:
+                params = {
+                    "exhaustiveness": exhaustiveness,
+                    "box_size": [box_x, box_y, box_z],
+                    "num_modes": 5,
+                    "frag_threshold": frag_thresh,
+                    "evolved_threshold": evolved_thresh,
+                    "db_threshold": db_thresh,
+                    "data_dir": os.path.join(os.path.dirname(__file__), "data"),
+                }
                 pipeline = HybridPipeline(
                     active_mols=active_mols,
                     active_smiles=active_smiles,
                     pdb_block=pdb_block,
                     fragment_sdf_path=frag_path,
                     pharmit_json=pharmit_json,
-                    params={
-                        "exhaustiveness": exhaustiveness,
-                        "box_size": [box_x, box_y, box_z],
-                        "num_modes": 5,
-                        "frag_threshold": frag_thresh,
-                        "evolved_threshold": evolved_thresh,
-                        "db_threshold": db_thresh,
-                        "data_dir": os.path.join(os.path.dirname(__file__), "data"),
-                    }
+                    params=params,
                 )
+                st.session_state.pipeline      = pipeline
+                st.session_state.pipeline_step = 0
+                st.session_state.pipeline_run  = False
+                st.session_state.pipeline_error = None
+                # Clear old download cache
+                for k in ["dl_frag_csv","dl_db_csv","dl_combined_csv","dl_admet_csv",
+                          "dl_origins_csv","dl_docking_csv","dl_pharm_json","dl_viewer_html","dl_zip"]:
+                    st.session_state[k] = None
 
-            # Reset stop event and state flags
-            stop_event = threading.Event()
-            st.session_state.stop_event       = stop_event
-            st.session_state.pipeline         = pipeline
-            st.session_state.pipeline_running = True
-            st.session_state.pipeline_paused  = False
-            st.session_state.pipeline_run     = False
-            st.session_state.pipeline_error   = None
-            st.session_state.progress         = 0.0
-            st.session_state.status_msg       = "Starting pipeline…"
-
-            # Shared progress holder between thread and main thread
-            progress_holder = {
-                "progress": 0.0,
-                "msg": "Starting…",
-                "step": resume_step,
-                "done": False,
-                "paused": False,
-                "paused_step": resume_step,
-                "error": None,
-            }
-
-            # Build a resume-aware thread function
-            def _resume_aware_run():
-                """Wraps _run_pipeline_thread but skips already-completed steps."""
-                try:
-                    def cb(frac, msg):
-                        progress_holder["progress"] = frac
-                        progress_holder["msg"] = msg
-
-                    step = resume_step
-
-                    if step < 1:
-                        progress_holder["step"] = 1
-                        pipeline.step0_pharmacophore(lambda f, m: cb(f * 0.10, m))
-                        if stop_event.is_set():
-                            raise PipelineInterrupted(1)
-
-                    if step < 2:
-                        progress_holder["step"] = 2
-                        pipeline.step1_classifier(lambda f, m: cb(0.10 + f * 0.10, m))
-                        if stop_event.is_set():
-                            raise PipelineInterrupted(2)
-
-                    if step < 3:
-                        progress_holder["step"] = 3
-                        pipeline.pathway1_fbdd(lambda f, m: cb(0.20 + f * 0.35, m))
-                        if stop_event.is_set():
-                            raise PipelineInterrupted(3)
-
-                    if step < 4:
-                        progress_holder["step"] = 4
-                        pipeline.pathway2_screening(lambda f, m: cb(0.55 + f * 0.35, m))
-                        if stop_event.is_set():
-                            raise PipelineInterrupted(4)
-
-                    # Step 5: Combine
-                    progress_holder["step"] = 5
-                    cb(0.92, "📊 Combining results from both pathways…")
-                    pipeline.combine_results()
-                    cb(1.0, "✅ Pipeline complete!")
-                    progress_holder["done"] = True
-
-                except PipelineInterrupted as e:
-                    progress_holder["paused"] = True
-                    progress_holder["paused_step"] = e.step
-                except Exception as e:
-                    progress_holder["error"] = str(e)
-                    logger.exception("Pipeline thread error")
-
-            thread = threading.Thread(target=_resume_aware_run, daemon=True)
-            thread.start()
-
-            # ── Synchronous wait-loop with live progress display ──
-            # We poll until the thread finishes, updating UI each cycle.
-            # (Streamlit does not natively support async background threads,
-            #  but this pattern works on HF Spaces with a single worker.)
-            import time
-            bar = progress_bar_placeholder.progress(0.0)
-            txt = status_text_placeholder.empty()
-
-            while thread.is_alive():
-                p   = min(float(progress_holder.get("progress", 0.0)), 1.0)
-                msg = progress_holder.get("msg", "")
-                bar.progress(p)
-                txt.markdown(f"**{msg}**")
-                time.sleep(0.5)
-
-            # Thread finished — read final state
-            if progress_holder.get("done"):
-                st.session_state.pipeline_running = False
-                st.session_state.pipeline_run     = True
-                st.session_state.pipeline_paused  = False
-                st.session_state.pipeline_step    = 5
-                st.session_state.progress         = 1.0
-                st.session_state.status_msg       = "✅ Pipeline complete!"
-                bar.progress(1.0)
-                txt.markdown("**✅ Pipeline complete!**")
-                # Pre-cache all downloads NOW so page never resets on download
-                _cache_downloads(pipeline)
-                st.success("✅ Pipeline completed successfully!")
-                st.balloons()
-
-            elif progress_holder.get("paused"):
-                paused_at = progress_holder.get("paused_step", 0)
-                st.session_state.pipeline_running = False
-                st.session_state.pipeline_paused  = True
-                st.session_state.pipeline_step    = paused_at
-                st.session_state.progress         = progress_holder.get("progress", 0.0)
-                st.session_state.status_msg       = f"⏸️ Paused after step {paused_at}"
-                step_names = {1: "Pharmacophore", 2: "Classifier", 3: "FBDD", 4: "Database"}
-                bar.progress(min(float(progress_holder.get("progress", 0.0)), 1.0))
-                txt.markdown(f"**⏸️ Paused after: {step_names.get(paused_at, 'Unknown')}**")
-                st.warning(f"⏸️ Pipeline paused after {step_names.get(paused_at, 'step')}. Click **▶️ Resume Pipeline** to continue.")
-
-            elif progress_holder.get("error"):
-                err = progress_holder["error"]
-                st.session_state.pipeline_running = False
-                st.session_state.pipeline_error   = err
-                st.error(f"❌ Pipeline error: {err}")
-
+        if error_msg:
+            st.error(f"❌ {error_msg}")
+        else:
+            # Mark as running and trigger first step via auto-advance
+            st.session_state.pipeline_running     = True
+            st.session_state.pipeline_paused      = False
+            st.session_state.pause_requested      = False
+            st.session_state.pipeline_auto_advance = True
             st.rerun()
 
 
@@ -650,24 +633,24 @@ with tabs[1]:
     st.markdown("## 🔬 Pharmacophore Model")
     pipeline = st.session_state.pipeline
 
-    if pipeline and pipeline.pharmacophore_features:
+    if pipeline and getattr(pipeline, "pharmacophore_features", None):
         features = pipeline.pharmacophore_features
         col1, col2 = st.columns([1, 1])
-
         with col1:
             st.markdown("### Feature Table")
-            feat_data = [{"Type": f["type"], "X": round(f["center"][0],2),
-                          "Y": round(f["center"][1],2), "Z": round(f["center"][2],2),
-                          "Radius": f.get("radius",1.5), "Frequency": f.get("frequency",1.0)}
+            feat_data = [{"Type": f["type"],
+                          "X": round(f["center"][0], 2),
+                          "Y": round(f["center"][1], 2),
+                          "Z": round(f["center"][2], 2),
+                          "Radius": f.get("radius", 1.5),
+                          "Frequency": f.get("frequency", 1.0)}
                          for f in features]
             st.dataframe(pd.DataFrame(feat_data), use_container_width=True)
-
-            if pipeline.pharmit_json and st.session_state.dl_pharm_json:
+            if st.session_state.dl_pharm_json:
                 st.download_button("📥 Download Pharmacophore JSON",
                     st.session_state.dl_pharm_json,
                     "pharmacophore_model.json", "application/json",
                     key="dl_pharm_tab2")
-
         with col2:
             st.markdown("### 3D Viewer")
             if pipeline.pdb_block:
@@ -677,21 +660,21 @@ with tabs[1]:
                 for f in features:
                     color = FEATURE_COLORS.get(f["type"], "#FFFFFF")
                     view.addSphere({"center": {"x": f["center"][0], "y": f["center"][1], "z": f["center"][2]},
-                                    "radius": f.get("radius",1.5), "color": color, "opacity": 0.5})
+                                    "radius": f.get("radius", 1.5), "color": color, "opacity": 0.5})
                 view.zoomTo()
                 showmol(view, height=450, width=600)
 
-        if pipeline.classifier_metrics:
+        if getattr(pipeline, "classifier_metrics", None):
             st.markdown("### 🤖 Classifier Metrics")
-            metrics = pipeline.classifier_metrics
-            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-            mc1.metric("Accuracy",  f"{metrics.get('accuracy',0):.3f}")
-            mc2.metric("ROC-AUC",   f"{metrics.get('roc_auc',0):.3f}")
-            mc3.metric("Precision", f"{metrics.get('precision',0):.3f}")
-            mc4.metric("Recall",    f"{metrics.get('recall',0):.3f}")
-            mc5.metric("F1 Score",  f"{metrics.get('f1',0):.3f}")
+            m = pipeline.classifier_metrics
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Accuracy",  f"{m.get('accuracy',0):.3f}")
+            c2.metric("ROC-AUC",   f"{m.get('roc_auc',0):.3f}")
+            c3.metric("Precision", f"{m.get('precision',0):.3f}")
+            c4.metric("Recall",    f"{m.get('recall',0):.3f}")
+            c5.metric("F1 Score",  f"{m.get('f1',0):.3f}")
     else:
-        st.info("Run the pipeline first to see pharmacophore results.")
+        st.info("Run the pipeline first (at least through Step 1) to see pharmacophore results.")
 
 
 # ─── TAB 3: FRAGMENT RESULTS ────────────────────────
@@ -699,14 +682,14 @@ with tabs[2]:
     st.markdown("## 🧬 Fragment-Based Drug Design Results")
     pipeline = st.session_state.pipeline
 
-    if pipeline and pipeline.fragment_leads:
+    if pipeline and getattr(pipeline, "fragment_leads", None):
         if pipeline.pathway1_results:
             r = pipeline.pathway1_results
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Library Size",       r.get("n_library", 0))
-            mc2.metric("Scored Fragments",   r.get("n_scored", 0))
-            mc3.metric("Evolved Structures", r.get("n_evolved", 0))
-            mc4.metric("Final Leads",        len(pipeline.fragment_leads))
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Library Size",       r.get("n_library", 0))
+            c2.metric("Scored Fragments",   r.get("n_scored", 0))
+            c3.metric("Evolved Structures", r.get("n_evolved", 0))
+            c4.metric("Final Leads",        len(pipeline.fragment_leads))
 
         st.markdown("### 🏆 Top Fragment-Derived Leads")
         lead_data = []
@@ -714,38 +697,36 @@ with tabs[2]:
             admet = lead.get("admet", {})
             lead_data.append({
                 "Rank": i + 1,
-                "SMILES": lead.get("smiles","")[:60] + "…",
-                "Origin": lead.get("provenance","")[:50],
-                "Docking":     f"{lead.get('docking_score',0):.2f}",
-                "Classifier":  f"{lead.get('classifier_score',0):.3f}",
-                "MPO":         f"{lead.get('mpo_score',0):.3f}",
-                "Final":       f"{lead.get('final_score',0):.4f}",
+                "SMILES":     lead.get("smiles","")[:60] + "…",
+                "Origin":     lead.get("provenance","")[:50],
+                "Docking":    f"{lead.get('docking_score',0):.2f}",
+                "Classifier": f"{lead.get('classifier_score',0):.3f}",
+                "MPO":        f"{lead.get('mpo_score',0):.3f}",
+                "Final":      f"{lead.get('final_score',0):.4f}",
                 "MW": admet.get("MW",""), "QED": admet.get("QED",""),
             })
         st.dataframe(pd.DataFrame(lead_data), use_container_width=True, height=500)
 
         st.markdown("### 📊 ADMET Profiles")
-        sel_idx = st.selectbox("Select Lead for ADMET Detail", range(len(pipeline.fragment_leads)),
-                               format_func=lambda i: f"Lead {i+1}: {pipeline.fragment_leads[i].get('smiles','')[:40]}…")
-        if sel_idx is not None:
-            lead  = pipeline.fragment_leads[sel_idx]
+        sel = st.selectbox("Select Lead for ADMET Detail", range(len(pipeline.fragment_leads)),
+                           format_func=lambda i: f"Lead {i+1}: {pipeline.fragment_leads[i].get('smiles','')[:40]}…")
+        if sel is not None:
+            lead  = pipeline.fragment_leads[sel]
             admet = lead.get("admet", {})
             if admet:
-                col1, col2 = st.columns([1, 1])
-                with col1:
-                    fig = generate_radar_chart(admet, f"Lead {sel_idx+1} ADMET")
-                    st.plotly_chart(fig, use_container_width=True)
-                with col2:
+                ca, cb_ = st.columns(2)
+                with ca:
+                    st.plotly_chart(generate_radar_chart(admet, f"Lead {sel+1}"), use_container_width=True)
+                with cb_:
                     smi = lead.get("smiles","")
                     mol = Chem.MolFromSmiles(smi)
                     if mol and Draw:
-                        img = Draw.MolToImage(mol, size=(400, 300))
-                        st.image(img, caption=f"Lead {sel_idx+1}")
+                        st.image(Draw.MolToImage(mol, size=(400, 300)), caption=f"Lead {sel+1}")
                     st.markdown(f"**SMILES:** `{smi}`")
                     st.markdown(f"**Provenance:** {lead.get('provenance','')}")
-                    st.markdown(f"**Docking Score:** {lead.get('docking_score',0):.2f} kcal/mol")
+                    st.markdown(f"**Docking:** {lead.get('docking_score',0):.2f} kcal/mol")
     else:
-        st.info("Run the pipeline first to see fragment results.")
+        st.info("Run the pipeline first (through Step 3 — FBDD) to see fragment results.")
 
 
 # ─── TAB 4: DATABASE RESULTS ────────────────────────
@@ -753,22 +734,20 @@ with tabs[3]:
     st.markdown("## 🗄️ Database Screening Results")
     pipeline = st.session_state.pipeline
 
-    if pipeline and pipeline.database_leads:
+    if pipeline and getattr(pipeline, "database_leads", None):
         if pipeline.pathway2_results:
             r  = pipeline.pathway2_results
             sc = r.get("source_counts", {})
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Total Screened",   r.get("total_screened", 0))
-            mc2.metric("Above Threshold",  r.get("total_filtered", 0))
-            mc3.metric("Sources Used",     len(sc))
-            mc4.metric("Final Leads",      len(pipeline.database_leads))
-
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Screened",  r.get("total_screened", 0))
+            c2.metric("Above Threshold", r.get("total_filtered", 0))
+            c3.metric("Sources Used",    len(sc))
+            c4.metric("Final Leads",     len(pipeline.database_leads))
             if sc:
-                st.markdown("### 📊 Database Hit Distribution")
                 fig = px.pie(names=list(sc.keys()), values=list(sc.values()),
                              color_discrete_sequence=px.colors.qualitative.Set3, hole=0.4)
-                fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                                  font_color='#94a3b8', height=350)
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                                  font_color="#94a3b8", height=350)
                 st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("### 🏆 Top Database Leads")
@@ -787,28 +766,25 @@ with tabs[3]:
             })
         st.dataframe(pd.DataFrame(db_data), use_container_width=True, height=500)
 
-        st.markdown("### 📊 ADMET Profiles")
-        sel_db = st.selectbox("Select DB Lead", range(len(pipeline.database_leads)),
+        sel_db = st.selectbox("Select DB Lead for ADMET", range(len(pipeline.database_leads)),
                               format_func=lambda i: f"Lead {i+1}: {pipeline.database_leads[i].get('smiles','')[:40]}…",
                               key="db_admet_sel")
         if sel_db is not None:
             lead  = pipeline.database_leads[sel_db]
             admet = lead.get("admet", {})
             if admet:
-                col1, col2 = st.columns([1, 1])
-                with col1:
-                    fig = generate_radar_chart(admet, f"DB Lead {sel_db+1}")
-                    st.plotly_chart(fig, use_container_width=True)
-                with col2:
+                ca, cb_ = st.columns(2)
+                with ca:
+                    st.plotly_chart(generate_radar_chart(admet, f"DB Lead {sel_db+1}"), use_container_width=True)
+                with cb_:
                     smi = lead.get("smiles","")
                     mol = Chem.MolFromSmiles(smi)
                     if mol and Draw:
-                        img = Draw.MolToImage(mol, size=(400, 300))
-                        st.image(img, caption=f"DB Lead {sel_db+1}")
+                        st.image(Draw.MolToImage(mol, size=(400,300)), caption=f"DB Lead {sel_db+1}")
                     st.markdown(f"**Source:** {lead.get('source','')}")
                     st.markdown(f"**Docking:** {lead.get('docking_score',0):.2f} kcal/mol")
     else:
-        st.info("Run the pipeline first to see database results.")
+        st.info("Run the pipeline first (through Step 4 — DB Screening) to see database results.")
 
 
 # ─── TAB 5: COMBINED RANKING ────────────────────────
@@ -816,59 +792,56 @@ with tabs[4]:
     st.markdown("## 📊 Combined Leaderboard")
     pipeline = st.session_state.pipeline
 
-    if pipeline and pipeline.combined_leaderboard:
+    if pipeline and getattr(pipeline, "combined_leaderboard", None):
         lb = pipeline.combined_leaderboard
         st.markdown(f"### All {len(lb)} Leads — Ranked by Final Score")
-
         lb_data = []
-        for entry in lb:
-            admet = entry.get("admet", {})
+        for e in lb:
+            admet = e.get("admet", {})
             lb_data.append({
-                "Rank":          entry["rank"],
-                "Pathway":       entry["pathway"],
-                "SMILES":        entry.get("smiles","")[:50] + "…",
-                "Docking":       entry.get("docking_score", 0),
-                "Classifier":    entry.get("classifier_score", 0),
-                "MPO":           entry.get("mpo_score", 0),
-                "Final Score":   entry.get("final_score", 0),
+                "Rank":        e["rank"],
+                "Pathway":     e["pathway"],
+                "SMILES":      e.get("smiles","")[:50] + "…",
+                "Docking":     e.get("docking_score", 0),
+                "Classifier":  e.get("classifier_score", 0),
+                "MPO":         e.get("mpo_score", 0),
+                "Final Score": e.get("final_score", 0),
                 "MW":   admet.get("MW",""), "cLogP": admet.get("cLogP",""),
                 "TPSA": admet.get("TPSA",""), "QED":  admet.get("QED",""),
             })
         st.dataframe(pd.DataFrame(lb_data), use_container_width=True, height=600)
 
         st.markdown("### 🔀 Multi-Parameter Visualization")
-        pc_data = [{"Docking Score": e.get("docking_score",0),
-                    "MW":   e.get("admet",{}).get("MW",0),
-                    "cLogP": e.get("admet",{}).get("cLogP",0),
-                    "TPSA": e.get("admet",{}).get("TPSA",0),
-                    "QED":  e.get("admet",{}).get("QED",0),
-                    "Pathway": 0 if e.get("pathway_label") == "Fragment" else 1}
-                   for e in lb]
-        if pc_data:
-            df_pc = pd.DataFrame(pc_data)
-            fig = px.parallel_coordinates(df_pc, color="Pathway",
+        pc = [{"Docking Score": e.get("docking_score",0),
+               "MW":   e.get("admet",{}).get("MW",0),
+               "cLogP": e.get("admet",{}).get("cLogP",0),
+               "TPSA": e.get("admet",{}).get("TPSA",0),
+               "QED":  e.get("admet",{}).get("QED",0),
+               "Pathway": 0 if e.get("pathway_label")=="Fragment" else 1}
+              for e in lb]
+        if pc:
+            fig = px.parallel_coordinates(pd.DataFrame(pc), color="Pathway",
                 color_continuous_scale=["#6366f1","#ec4899"],
                 dimensions=["Docking Score","MW","cLogP","TPSA","QED"])
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                              font_color='#94a3b8', height=450)
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                              font_color="#94a3b8", height=450)
             st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("### 📈 Docking vs Classifier Score")
-        scatter_data = [{"Vina Score": e.get("docking_score",0),
-                         "Classifier Prob": e.get("classifier_score",0),
-                         "Pathway": e.get("pathway_label",""),
-                         "SMILES": e.get("smiles","")[:30]}
-                        for e in lb]
-        if scatter_data:
-            df_sc = pd.DataFrame(scatter_data)
-            fig = px.scatter(df_sc, x="Vina Score", y="Classifier Prob", color="Pathway",
-                             hover_data=["SMILES"],
+        sc_data = [{"Vina Score": e.get("docking_score",0),
+                    "Classifier Prob": e.get("classifier_score",0),
+                    "Pathway": e.get("pathway_label",""),
+                    "SMILES": e.get("smiles","")[:30]}
+                   for e in lb]
+        if sc_data:
+            fig = px.scatter(pd.DataFrame(sc_data), x="Vina Score", y="Classifier Prob",
+                             color="Pathway", hover_data=["SMILES"],
                              color_discrete_map={"Fragment":"#6366f1","Database":"#ec4899"})
-            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                              font_color='#94a3b8', height=400)
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                              font_color="#94a3b8", height=400)
             st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Run the pipeline first to see combined results.")
+        st.info("Run the full pipeline to see combined results.")
 
 
 # ─── TAB 6: FRAGMENT ORIGINS ────────────────────────
@@ -876,19 +849,17 @@ with tabs[5]:
     st.markdown("## 🔗 Fragment Provenance & Origins")
     pipeline = st.session_state.pipeline
 
-    if pipeline and pipeline.fragment_leads:
+    if pipeline and getattr(pipeline, "fragment_leads", None):
         for i, lead in enumerate(pipeline.fragment_leads[:20]):
             with st.expander(f"Lead {i+1}: {lead.get('smiles','')[:50]}…", expanded=(i < 3)):
-                prov = lead.get("provenance","")
-                st.markdown(f"**Provenance:** `{prov}`")
+                st.markdown(f"**Provenance:** `{lead.get('provenance','')}`")
                 st.markdown(f"**Method:** {lead.get('method','')}")
                 st.markdown(f"**Docking Score:** {lead.get('docking_score',0):.2f} kcal/mol")
                 st.markdown(f"**Final Score:** {lead.get('final_score',0):.4f}")
                 smi = lead.get("smiles","")
                 mol = Chem.MolFromSmiles(smi)
                 if mol and Draw:
-                    img = Draw.MolToImage(mol, size=(500, 300))
-                    st.image(img, caption="Evolved Molecule")
+                    st.image(Draw.MolToImage(mol, size=(500, 300)), caption="Evolved Molecule")
     else:
         st.info("Run the pipeline first to see fragment origins.")
 
@@ -898,24 +869,21 @@ with tabs[6]:
     st.markdown("## 🧬 Interactive 3D Molecular Viewer")
     pipeline = st.session_state.pipeline
 
-    if pipeline and pipeline.combined_leaderboard and pipeline.pdb_block:
+    if pipeline and getattr(pipeline, "combined_leaderboard", None) and pipeline.pdb_block:
         lb = pipeline.combined_leaderboard
         sel_mol = st.selectbox("Select Molecule", range(len(lb)),
             format_func=lambda i: f"#{lb[i]['rank']} {lb[i]['pathway']} — {lb[i].get('smiles','')[:40]}…")
-
         if sel_mol is not None:
             entry = lb[sel_mol]
             view  = py3Dmol.view(width=800, height=550)
             view.addModel(pipeline.pdb_block, "pdb")
             view.setStyle({}, {"cartoon": {"color": "spectrum", "opacity": 0.6}})
             view.addSurface(py3Dmol.VDW, {"opacity": 0.1, "color": "white"})
-
-            if pipeline.pharmacophore_features:
+            if getattr(pipeline, "pharmacophore_features", None):
                 for f in pipeline.pharmacophore_features:
                     color = FEATURE_COLORS.get(f["type"], "#FFFFFF")
                     view.addSphere({"center": {"x": f["center"][0], "y": f["center"][1], "z": f["center"][2]},
                                     "radius": f.get("radius",1.5), "color": color, "opacity": 0.35})
-
             smi = entry.get("smiles","")
             mol = Chem.MolFromSmiles(smi)
             if mol:
@@ -923,112 +891,90 @@ with tabs[6]:
                     mol3d = Chem.AddHs(mol)
                     AllChem.EmbedMolecule(mol3d, AllChem.ETKDGv3())
                     AllChem.MMFFOptimizeMolecule(mol3d)
-                    mol_block = Chem.MolToMolBlock(mol3d)
-                    view.addModel(mol_block, "mol")
+                    view.addModel(Chem.MolToMolBlock(mol3d), "mol")
                     view.setStyle({"model": -1}, {"stick": {"colorscheme": "greenCarbon", "radius": 0.15}})
                 except Exception:
                     pass
-
             view.zoomTo()
             showmol(view, height=550, width=800)
             st.markdown(f"**SMILES:** `{smi}`")
             st.markdown(f"**Pathway:** {entry.get('pathway','')}")
     else:
-        st.info("Run the pipeline first to use the 3D viewer.")
+        st.info("Run the full pipeline to use the 3D viewer.")
 
 
 # ─── TAB 8: DOWNLOADS ───────────────────────────────
 with tabs[7]:
     st.markdown("## 📥 Download All Results")
 
-    # Use cached data — NEVER call pipeline methods here to avoid resets
     has_results = st.session_state.pipeline_run and any([
         st.session_state.dl_frag_csv,
-        st.session_state.dl_db_csv,
         st.session_state.dl_combined_csv,
     ])
 
     if has_results:
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
+        c1, c2, c3 = st.columns(3)
+        with c1:
             st.markdown("### 📄 CSV Reports")
             if st.session_state.dl_frag_csv:
                 st.download_button("⬇️ Fragment Results CSV",
-                    st.session_state.dl_frag_csv,
-                    "fragment_results.csv", "text/csv",
-                    key="dl_frag_csv_btn")
+                    st.session_state.dl_frag_csv, "fragment_results.csv", "text/csv",
+                    key="dl_frag_btn")
             if st.session_state.dl_db_csv:
                 st.download_button("⬇️ Database Results CSV",
-                    st.session_state.dl_db_csv,
-                    "database_results.csv", "text/csv",
-                    key="dl_db_csv_btn")
+                    st.session_state.dl_db_csv, "database_results.csv", "text/csv",
+                    key="dl_db_btn")
             if st.session_state.dl_combined_csv:
                 st.download_button("⬇️ Combined Leaderboard CSV",
-                    st.session_state.dl_combined_csv,
-                    "combined_leaderboard.csv", "text/csv",
-                    key="dl_combined_csv_btn")
-
-        with col2:
+                    st.session_state.dl_combined_csv, "combined_leaderboard.csv", "text/csv",
+                    key="dl_combined_btn")
+        with c2:
             st.markdown("### 📊 Detailed Reports")
             if st.session_state.dl_admet_csv:
                 st.download_button("⬇️ ADMET Full Report",
-                    st.session_state.dl_admet_csv,
-                    "admet_full_report.csv", "text/csv",
+                    st.session_state.dl_admet_csv, "admet_full_report.csv", "text/csv",
                     key="dl_admet_btn")
             if st.session_state.dl_origins_csv:
                 st.download_button("⬇️ Fragment Origins CSV",
-                    st.session_state.dl_origins_csv,
-                    "fragment_origins.csv", "text/csv",
+                    st.session_state.dl_origins_csv, "fragment_origins.csv", "text/csv",
                     key="dl_origins_btn")
             if st.session_state.dl_docking_csv:
                 st.download_button("⬇️ Docking Scores CSV",
-                    st.session_state.dl_docking_csv,
-                    "docking_scores_all.csv", "text/csv",
+                    st.session_state.dl_docking_csv, "docking_scores_all.csv", "text/csv",
                     key="dl_docking_btn")
-
-        with col3:
+        with c3:
             st.markdown("### 📦 Full Package")
             if st.session_state.dl_pharm_json:
                 st.download_button("⬇️ Pharmacophore JSON",
-                    st.session_state.dl_pharm_json,
-                    "pharmacophore_model.json", "application/json",
+                    st.session_state.dl_pharm_json, "pharmacophore_model.json", "application/json",
                     key="dl_pharm_btn")
             if st.session_state.dl_viewer_html:
                 st.download_button("⬇️ 3D Viewer HTML",
-                    st.session_state.dl_viewer_html,
-                    "pharmacophore_viewer.html", "text/html",
+                    st.session_state.dl_viewer_html, "pharmacophore_viewer.html", "text/html",
                     key="dl_viewer_btn")
 
         st.divider()
         st.markdown("### 🗜️ Download Everything as ZIP")
         if st.session_state.dl_zip:
-            st.download_button(
-                "⬇️ Download ZIP Archive",
-                st.session_state.dl_zip,
-                "hydra_results.zip",
-                "application/zip",
-                use_container_width=True,
-                key="dl_zip_btn",
-            )
+            st.download_button("⬇️ Download ZIP Archive",
+                st.session_state.dl_zip, "hydra_results.zip", "application/zip",
+                use_container_width=True, key="dl_zip_btn")
         else:
-            # ZIP wasn't pre-generated (maybe failed) — offer re-generation
-            if st.button("📦 Generate ZIP Archive", type="primary", use_container_width=True,
-                         key="gen_zip_btn"):
+            if st.button("📦 Generate ZIP", type="primary", use_container_width=True, key="gen_zip_btn"):
                 pipeline = st.session_state.pipeline
                 if pipeline:
-                    with st.spinner("Packaging all files…"):
+                    with st.spinner("Packaging…"):
                         try:
-                            zip_data = pipeline.create_zip()
-                            st.session_state.dl_zip = zip_data
+                            st.session_state.dl_zip = pipeline.create_zip()
                             st.rerun()
                         except Exception as e:
-                            st.error(f"ZIP generation failed: {e}")
+                            st.error(f"ZIP failed: {e}")
 
     elif st.session_state.pipeline_paused:
-        st.warning("⏸️ Pipeline is paused. Resume and complete it to download results.")
+        step = st.session_state.pipeline_step
+        st.warning(f"⏸️ Pipeline paused at step {step}/4. Resume to complete and unlock downloads.")
     else:
-        st.info("Run the pipeline first to download results.")
+        st.info("Run the full pipeline to download results.")
 
 
 # ─── FOOTER ──────────────────────────────────────────
