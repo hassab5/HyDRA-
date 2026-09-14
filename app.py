@@ -104,6 +104,16 @@ def _init():
         "pipeline_error": None,
         "pause_requested": False,
         "do_advance": False,       # trigger next step on this rerun
+        # cached DISPLAY results — simple serializable dicts, survive widget reruns
+        "res_pharm_features": None,   # list of dicts
+        "res_classifier_metrics": None,  # dict
+        "res_pdb_block": None,        # str
+        "res_frag_leads": None,       # list of dicts (no mol objects)
+        "res_frag_stats": None,       # dict
+        "res_db_leads": None,         # list of dicts (no mol objects)
+        "res_db_stats": None,         # dict
+        "res_combined": None,         # list of dicts (no mol objects)
+        "res_summary": None,          # dict
         # cached downloads
         "dl_frag_csv":None,"dl_db_csv":None,"dl_combined_csv":None,
         "dl_admet_csv":None,"dl_origins_csv":None,"dl_docking_csv":None,
@@ -160,7 +170,37 @@ def load_demo():
             mols.append(mol); smiles.append(smi)
     return mols, smiles, EGFR_PDB
 
-# ─── DOWNLOAD CACHE ───────────────────────────────────────────
+# ─── RESULTS CACHE — survives widget reruns even if pipeline object is lost ──
+def _strip_mol(lead):
+    """Return a copy of a lead dict without RDKit mol objects."""
+    return {k: v for k, v in lead.items() if k != "mol"}
+
+def _cache_results(pipeline):
+    """Copy all display-worthy data into simple session_state entries."""
+    try:
+        if getattr(pipeline, "pharmacophore_features", None):
+            st.session_state.res_pharm_features = pipeline.pharmacophore_features
+        if getattr(pipeline, "classifier_metrics", None):
+            st.session_state.res_classifier_metrics = pipeline.classifier_metrics
+        if getattr(pipeline, "pdb_block", None):
+            st.session_state.res_pdb_block = pipeline.pdb_block
+        if getattr(pipeline, "fragment_leads", None):
+            st.session_state.res_frag_leads = [_strip_mol(l) for l in pipeline.fragment_leads]
+        if getattr(pipeline, "pathway1_results", None):
+            st.session_state.res_frag_stats = pipeline.pathway1_results
+        if getattr(pipeline, "database_leads", None):
+            st.session_state.res_db_leads = [_strip_mol(l) for l in pipeline.database_leads]
+        if getattr(pipeline, "pathway2_results", None):
+            st.session_state.res_db_stats = pipeline.pathway2_results
+        if getattr(pipeline, "combined_leaderboard", None):
+            st.session_state.res_combined = [_strip_mol(e) for e in pipeline.combined_leaderboard]
+        try:
+            st.session_state.res_summary = pipeline.get_summary()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Results cache: {e}")
+
 def _cache_dl(pipeline):
     try:
         st.session_state.dl_frag_csv     = pipeline.export_fragment_results_csv()
@@ -219,6 +259,7 @@ def _run_step(pipeline, bar, txt):
             st.session_state.pipeline_run  = True
             st.session_state.pipeline_paused = False
             st.session_state.do_advance    = False
+            _cache_results(pipeline)
             _cache_dl(pipeline)
             return "done"
 
@@ -271,10 +312,9 @@ with st.sidebar:
         st.markdown('<div class="banner-pause">⏸️ Paused</div>', unsafe_allow_html=True)
     elif is_done:
         st.markdown('<div class="banner-done">✅ Complete</div>', unsafe_allow_html=True)
-        pipeline_obj = st.session_state.pipeline
-        if pipeline_obj:
+        s = st.session_state.res_summary
+        if s:
             try:
-                s = pipeline_obj.get_summary()
                 st.metric("Pharm. Features", s["pharmacophore"]["n_features"])
                 st.metric("Fragment Leads",  s["pathway1"]["n_leads"])
                 st.metric("Database Leads",  s["pathway2"]["n_leads"])
@@ -477,7 +517,10 @@ with tabs[0]:
                 st.session_state.pipeline_run     = False
                 st.session_state.pipeline_error   = None
                 for k in ["dl_frag_csv","dl_db_csv","dl_combined_csv","dl_admet_csv",
-                          "dl_origins_csv","dl_docking_csv","dl_pharm_json","dl_viewer_html","dl_zip"]:
+                          "dl_origins_csv","dl_docking_csv","dl_pharm_json","dl_viewer_html","dl_zip",
+                          "res_pharm_features","res_classifier_metrics","res_pdb_block",
+                          "res_frag_leads","res_frag_stats","res_db_leads","res_db_stats",
+                          "res_combined","res_summary"]:
                     st.session_state[k] = None
                 logger.info("FRESH RUN: new pipeline created")
 
@@ -517,9 +560,9 @@ with tabs[0]:
 # ─── TAB 2: PHARMACOPHORE ────────────────────────────────────
 with tabs[1]:
     st.markdown("## 🔬 Pharmacophore Model")
-    p = st.session_state.pipeline
-    if p and getattr(p, "pharmacophore_features", None):
-        features = p.pharmacophore_features
+    features = st.session_state.res_pharm_features
+    pdb_blk  = st.session_state.res_pdb_block
+    if features:
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### Feature Table")
@@ -531,17 +574,17 @@ with tabs[1]:
                     "pharmacophore.json","application/json", key="dl_pharm_t2")
         with c2:
             st.markdown("### 3D Viewer")
-            if p.pdb_block:
+            if pdb_blk:
                 v = py3Dmol.view(width=600, height=450)
-                v.addModel(p.pdb_block,"pdb")
+                v.addModel(pdb_blk,"pdb")
                 v.setStyle({},{"cartoon":{"color":"spectrum","opacity":0.7}})
                 for f in features:
                     v.addSphere({"center":{"x":f["center"][0],"y":f["center"][1],"z":f["center"][2]},
                                  "radius":f.get("radius",1.5),"color":FEATURE_COLORS.get(f["type"],"#FFF"),"opacity":0.5})
                 v.zoomTo(); showmol(v, height=450, width=600)
-        if getattr(p,"classifier_metrics",None):
+        m = st.session_state.res_classifier_metrics
+        if m:
             st.markdown("### 🤖 Classifier Metrics")
-            m = p.classifier_metrics
             mc = st.columns(5)
             for col, (k, lbl) in zip(mc, [("accuracy","Accuracy"),("roc_auc","ROC-AUC"),
                                            ("precision","Precision"),("recall","Recall"),("f1","F1")]):
@@ -553,15 +596,15 @@ with tabs[1]:
 # ─── TAB 3: FRAGMENT RESULTS ─────────────────────────────────
 with tabs[2]:
     st.markdown("## 🧬 Fragment-Based Drug Design Results")
-    p = st.session_state.pipeline
-    if p and getattr(p,"fragment_leads",None):
-        if p.pathway1_results:
-            r = p.pathway1_results
+    _fl = st.session_state.res_frag_leads
+    if _fl:
+        _fs = st.session_state.res_frag_stats
+        if _fs:
             cc = st.columns(4)
-            cc[0].metric("Library",  r.get("n_library",0))
-            cc[1].metric("Scored",   r.get("n_scored",0))
-            cc[2].metric("Evolved",  r.get("n_evolved",0))
-            cc[3].metric("Leads",    len(p.fragment_leads))
+            cc[0].metric("Library",  _fs.get("n_library",0))
+            cc[1].metric("Scored",   _fs.get("n_scored",0))
+            cc[2].metric("Evolved",  _fs.get("n_evolved",0))
+            cc[3].metric("Leads",    len(_fl))
         ld = [{"Rank":i+1,"SMILES":l.get("smiles","")[:55]+"…",
                "Docking":f"{l.get('docking_score',0):.2f}",
                "Classifier":f"{l.get('classifier_score',0):.3f}",
@@ -569,12 +612,12 @@ with tabs[2]:
                "Final":f"{l.get('final_score',0):.4f}",
                "MW":l.get("admet",{}).get("MW",""),
                "QED":l.get("admet",{}).get("QED","")}
-              for i,l in enumerate(p.fragment_leads)]
+              for i,l in enumerate(_fl)]
         st.dataframe(pd.DataFrame(ld), use_container_width=True, height=480)
-        sel = st.selectbox("ADMET detail", range(len(p.fragment_leads)),
-              format_func=lambda i: f"Lead {i+1}: {p.fragment_leads[i].get('smiles','')[:40]}…")
+        sel = st.selectbox("ADMET detail", range(len(_fl)),
+              format_func=lambda i: f"Lead {i+1}: {_fl[i].get('smiles','')[:40]}…")
         if sel is not None:
-            lead = p.fragment_leads[sel]; admet = lead.get("admet",{})
+            lead = _fl[sel]; admet = lead.get("admet",{})
             if admet:
                 ca, cb_ = st.columns(2)
                 with ca: st.plotly_chart(generate_radar_chart(admet,f"Lead {sel+1}"),use_container_width=True)
@@ -590,15 +633,16 @@ with tabs[2]:
 # ─── TAB 4: DATABASE RESULTS ─────────────────────────────────
 with tabs[3]:
     st.markdown("## 🗄️ Database Screening Results")
-    p = st.session_state.pipeline
-    if p and getattr(p,"database_leads",None):
-        if p.pathway2_results:
-            r = p.pathway2_results; sc = r.get("source_counts",{})
+    _dl = st.session_state.res_db_leads
+    if _dl:
+        _ds = st.session_state.res_db_stats
+        if _ds:
+            sc = _ds.get("source_counts",{})
             cc = st.columns(4)
-            cc[0].metric("Screened",  r.get("total_screened",0))
-            cc[1].metric("Filtered",  r.get("total_filtered",0))
+            cc[0].metric("Screened",  _ds.get("total_screened",0))
+            cc[1].metric("Filtered",  _ds.get("total_filtered",0))
             cc[2].metric("Sources",   len(sc))
-            cc[3].metric("Leads",     len(p.database_leads))
+            cc[3].metric("Leads",     len(_dl))
             if sc:
                 fig = px.pie(names=list(sc.keys()),values=list(sc.values()),
                              color_discrete_sequence=px.colors.qualitative.Set3,hole=0.4)
@@ -608,12 +652,12 @@ with tabs[3]:
                "Docking":f"{l.get('docking_score',0):.2f}","Classifier":f"{l.get('classifier_score',0):.3f}",
                "MPO":f"{l.get('mpo_score',0):.3f}","Final":f"{l.get('final_score',0):.4f}",
                "MW":l.get("admet",{}).get("MW",""),"QED":l.get("admet",{}).get("QED","")}
-              for i,l in enumerate(p.database_leads)]
+              for i,l in enumerate(_dl)]
         st.dataframe(pd.DataFrame(ld), use_container_width=True, height=480)
-        sel = st.selectbox("ADMET detail", range(len(p.database_leads)),
-              format_func=lambda i: f"Lead {i+1}: {p.database_leads[i].get('smiles','')[:40]}…",key="db_sel")
+        sel = st.selectbox("ADMET detail", range(len(_dl)),
+              format_func=lambda i: f"Lead {i+1}: {_dl[i].get('smiles','')[:40]}…",key="db_sel")
         if sel is not None:
-            lead = p.database_leads[sel]; admet = lead.get("admet",{})
+            lead = _dl[sel]; admet = lead.get("admet",{})
             if admet:
                 ca,cb_ = st.columns(2)
                 with ca: st.plotly_chart(generate_radar_chart(admet,f"DB Lead {sel+1}"),use_container_width=True)
@@ -629,21 +673,20 @@ with tabs[3]:
 # ─── TAB 5: COMBINED RANKING ─────────────────────────────────
 with tabs[4]:
     st.markdown("## 📊 Combined Leaderboard")
-    p = st.session_state.pipeline
-    if p and getattr(p,"combined_leaderboard",None):
-        lb = p.combined_leaderboard
-        st.markdown(f"### All {len(lb)} Leads — Ranked by Final Score")
+    _cb = st.session_state.res_combined
+    if _cb:
+        st.markdown(f"### All {len(_cb)} Leads — Ranked by Final Score")
         lbd = [{"Rank":e["rank"],"Pathway":e["pathway"],"SMILES":e.get("smiles","")[:50]+"…",
                 "Docking":e.get("docking_score",0),"Classifier":e.get("classifier_score",0),
                 "MPO":e.get("mpo_score",0),"Final":e.get("final_score",0),
                 "MW":e.get("admet",{}).get("MW",""),"cLogP":e.get("admet",{}).get("cLogP",""),
                 "TPSA":e.get("admet",{}).get("TPSA",""),"QED":e.get("admet",{}).get("QED","")}
-               for e in lb]
+               for e in _cb]
         st.dataframe(pd.DataFrame(lbd), use_container_width=True, height=580)
         pc = [{"Docking":e.get("docking_score",0),"MW":e.get("admet",{}).get("MW",0),
                "cLogP":e.get("admet",{}).get("cLogP",0),"TPSA":e.get("admet",{}).get("TPSA",0),
                "QED":e.get("admet",{}).get("QED",0),"Pathway":0 if e.get("pathway_label")=="Fragment" else 1}
-              for e in lb]
+              for e in _cb]
         if pc:
             fig = px.parallel_coordinates(pd.DataFrame(pc),color="Pathway",
                 color_continuous_scale=["#6366f1","#ec4899"],
@@ -651,7 +694,7 @@ with tabs[4]:
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",font_color="#94a3b8",height=430)
             st.plotly_chart(fig, use_container_width=True)
         scd = [{"Vina":e.get("docking_score",0),"Classifier":e.get("classifier_score",0),
-                "Pathway":e.get("pathway_label",""),"SMILES":e.get("smiles","")[:30]} for e in lb]
+                "Pathway":e.get("pathway_label",""),"SMILES":e.get("smiles","")[:30]} for e in _cb]
         if scd:
             fig2 = px.scatter(pd.DataFrame(scd),x="Vina",y="Classifier",color="Pathway",hover_data=["SMILES"],
                               color_discrete_map={"Fragment":"#6366f1","Database":"#ec4899"})
@@ -664,9 +707,9 @@ with tabs[4]:
 # ─── TAB 6: FRAGMENT ORIGINS ─────────────────────────────────
 with tabs[5]:
     st.markdown("## 🔗 Fragment Provenance & Origins")
-    p = st.session_state.pipeline
-    if p and getattr(p,"fragment_leads",None):
-        for i, lead in enumerate(p.fragment_leads[:20]):
+    _fl2 = st.session_state.res_frag_leads
+    if _fl2:
+        for i, lead in enumerate(_fl2[:20]):
             with st.expander(f"Lead {i+1}: {lead.get('smiles','')[:50]}…", expanded=(i<3)):
                 st.markdown(f"**Provenance:** `{lead.get('provenance','')}`")
                 st.markdown(f"**Method:** {lead.get('method','')}")
@@ -682,19 +725,20 @@ with tabs[5]:
 # ─── TAB 7: 3D VIEWER ────────────────────────────────────────
 with tabs[6]:
     st.markdown("## 🧬 Interactive 3D Molecular Viewer")
-    p = st.session_state.pipeline
-    if p and getattr(p,"combined_leaderboard",None) and p.pdb_block:
-        lb = p.combined_leaderboard
-        sel = st.selectbox("Select Molecule", range(len(lb)),
-            format_func=lambda i: f"#{lb[i]['rank']} {lb[i]['pathway']} — {lb[i].get('smiles','')[:40]}…")
+    _cb2 = st.session_state.res_combined
+    _pdb = st.session_state.res_pdb_block
+    _pf2 = st.session_state.res_pharm_features
+    if _cb2 and _pdb:
+        sel = st.selectbox("Select Molecule", range(len(_cb2)),
+            format_func=lambda i: f"#{_cb2[i]['rank']} {_cb2[i]['pathway']} — {_cb2[i].get('smiles','')[:40]}…")
         if sel is not None:
-            e = lb[sel]
+            e = _cb2[sel]
             v = py3Dmol.view(width=800, height=540)
-            v.addModel(p.pdb_block,"pdb")
+            v.addModel(_pdb,"pdb")
             v.setStyle({},{"cartoon":{"color":"spectrum","opacity":0.6}})
             v.addSurface(py3Dmol.VDW,{"opacity":0.1,"color":"white"})
-            if getattr(p,"pharmacophore_features",None):
-                for f in p.pharmacophore_features:
+            if _pf2:
+                for f in _pf2:
                     v.addSphere({"center":{"x":f["center"][0],"y":f["center"][1],"z":f["center"][2]},
                                  "radius":f.get("radius",1.5),"color":FEATURE_COLORS.get(f["type"],"#FFF"),"opacity":0.3})
             smi = e.get("smiles",""); mol = Chem.MolFromSmiles(smi)
