@@ -10,7 +10,7 @@ pinned: true
 
 # 🧬 HyDRA — Hybrid Drug Discovery Research Accelerator
 
-**Mohamed Sayed Hybrid Drug Design App**
+** Hybrid Drug Design App**
 
 A dual-pathway hybrid drug discovery pipeline combining **Fragment-Based Drug Design (FBDD)** and **Pharmacophore-Guided Database Screening** in a single Streamlit web application.
 
@@ -214,17 +214,6 @@ Click **"🧪 Load EGFR Demo Data"** on the Launch tab to load pre-packaged EGFR
 
 ---
 
-## 🌐 Deployment Platforms Comparison
-
-| Platform | Docker Support | Free Tier RAM | Vina Support | Verdict |
-|----------|---------------|---------------|--------------|---------|
-| **HF Spaces** | ✅ Docker SDK | 16 GB | ✅ Full | **Best choice** |
-| Streamlit Cloud | ❌ No Docker | 1 GB | ❌ No system deps | Too limited |
-| Render | ✅ Docker | 512 MB | ❌ Too little RAM | Not enough |
-| Railway | ✅ Docker | 512 MB (trial) | ⚠️ Limited | Short trial |
-| Fly.io | ✅ Docker | 256 MB | ❌ Too little RAM | Not enough |
-
----
 
 ## 👨‍🔬 Author
 
