@@ -216,8 +216,8 @@ Click **"🧪 Load EGFR Demo Data"** on the Launch tab to load pre-packaged EGFR
 
 
 ## 👨‍🔬 Author
-
-**Mohamed Sayed** — Computational Medicinal Chemistry
+**Mahmoud Elhassab** — Computational Medicinal Chemistry
+**Mohamed Sayed** — JuComputational Medicinal Chemistry
 
 ---
 
